@@ -37,6 +37,42 @@ system either improves the *accuracy* of that number (detection, Re-ID, staff
 exclusion, POS correlation) or its *actionability* (real-time metrics, session
 funnel, anomaly detection, live dashboard).
 
+## Submission deliverables
+
+This repository is the complete submission for the Purplle Tech Challenge PS3.
+Every required artefact lives at predictable paths:
+
+| Deliverable | Location | Notes |
+|---|---|---|
+| **Event log (JSONL)** | `smart-store/events.jsonl` | 2 842 events across both stores produced by `python -m pipeline.run --no-emit` against the supplied clips. Schema follows the **PDF page 5 "Required Output Schema"**. Validates 100 % against `app.models.Event` (Pydantic). All 7 of the 7 PDF event types observable in the supplied clips appear; ZONE_DWELL is absent because no visitor in the supplied clips dwells in a single zone for ≥ 30 s of continuous tracking — see CHOICES.md "Decision 4". |
+| **README.md** | this file | 5-command setup, endpoint catalogue, repo layout, coverage table. |
+| **DESIGN.md** | `smart-store/docs/DESIGN.md` | Plain-language architecture, includes an **AI-Assisted Decisions** section (six entries: detection-stack selection, Re-ID approach, schema design, anomaly p95 second-opinion, dashboard architecture, layout-extraction VLM use). |
+| **CHOICES.md** | `smart-store/docs/CHOICES.md` | Four load-bearing decisions, each with options-considered / what-the-AI-suggested / what-I-chose-and-why / what-would-change-my-mind: detection model + tracking, Re-ID approach, single composite `/insights` endpoint, **event schema (sample-file vs PDF)**. |
+| **Repo link** | this repository | `git clone … && cd smart-store && make smoke` is the reviewer's three-command path. |
+
+### Schema note (important — the PDF and the sample file disagree)
+
+The challenge ZIP ships both `data/sample_eventsbe42122.jsonl` and the PDF
+"Required Output Schema" on page 5. **They are not the same schema.** The
+sample file uses `id_token` / `store_code` / `event_timestamp` /
+`gender_pred` / `age_pred` / `is_face_hidden`. The PDF schema uses
+`event_id` / `store_id` / `visitor_id` / `timestamp` / `zone_id` /
+`dwell_ms` / `confidence` / `metadata.queue_depth` / `metadata.session_seq`.
+
+This codebase follows the **PDF schema**. Rationale (full version in
+`docs/CHOICES.md` — Decision 4): the analytics endpoints the PDF asks for
+(`/funnel`, `/heatmap`, `/anomalies`) require `zone_id`, `dwell_ms`, and the
+billing-queue events; those fields exist only in the PDF schema. PDF page 5's
+"Event Type Catalogue" lists eight event types (ENTRY, EXIT, ZONE_ENTER,
+ZONE_EXIT, ZONE_DWELL, BILLING_QUEUE_JOIN, BILLING_QUEUE_ABANDON, REENTRY)
+that the sample-file shape cannot represent. `app/models.py:1-6` calls this
+out in code: "PDF is the scored spec".
+
+If the grading rubric expects the sample-file shape, the call is reversible
+in roughly one day's work — `pipeline/emit.py:build_event` is the only place
+the schema is constructed; `app/models.py:Event` is the only validator.
+Reach out and the rebuild is straightforward.
+
 ## Quick start
 
 Three commands — well under the spec's five-command budget — get a reviewer
@@ -157,6 +193,42 @@ docker compose run --rm pipeline \
 The pipeline emits events to the API in batches of 200. The dashboard ticks
 live as events arrive. Pass `--no-emit` to write `events.jsonl` to disk instead
 (useful for offline grading).
+
+### Regenerating the submission `events.jsonl`
+
+The `smart-store/events.jsonl` file is the submission's event-log
+deliverable. To regenerate it locally from the supplied clips, without
+spinning up the API:
+
+```bash
+cd smart-store
+PYTHONPATH=. python -m pipeline.run --store STORE_BLR_001 --clip-dir "data/Store 1" --no-emit
+mv events.jsonl /tmp/store1.jsonl
+PYTHONPATH=. python -m pipeline.run --store STORE_BLR_002 --clip-dir "data/Store 2" --no-emit
+mv events.jsonl /tmp/store2.jsonl
+# concatenate + dedup by event_id (the API does this on ingest anyway)
+python3 -c "
+import json
+seen=set()
+for src in ['/tmp/store1.jsonl', '/tmp/store2.jsonl']:
+    for ln in open(src):
+        e = json.loads(ln)
+        if e['event_id'] in seen: continue
+        seen.add(e['event_id'])
+        print(ln.rstrip())
+" > events.jsonl
+# validate every line against the Pydantic schema
+PYTHONPATH=. python -c "
+from app.models import Event
+for ln in open('events.jsonl'): Event.model_validate_json(ln)
+print('OK')
+"
+```
+
+Numbers from the latest regeneration: **2 842 unique events** — Store 1: 1 956,
+Store 2: 886. By type: 31 ENTRY, 27 EXIT, 8 REENTRY, 1 387 ZONE_ENTER,
+1 353 ZONE_EXIT, 24 BILLING_QUEUE_JOIN, 12 BILLING_QUEUE_ABANDON. Total
+processing time ~10 minutes on an Apple Silicon CPU (`yolo11n.pt`, no GPU).
 
 ## Tests
 

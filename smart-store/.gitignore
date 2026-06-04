@@ -68,6 +68,11 @@ dashboard-src/dist/
 *.tsbuildinfo
 dashboard-src/tsconfig.tsbuildinfo
 
+# YOLO weights — downloaded on first pipeline run by ultralytics; not a
+# source artifact. Reviewers running `python -m pipeline.run` will fetch
+# them automatically (Dockerfile.pipeline pre-downloads them at build).
+*.pt
+
 # ---------- IDE / editors ----------
 .vscode/
 .idea/

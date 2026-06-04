@@ -53,16 +53,13 @@ class CameraState:
     """Per-camera scratch state."""
     track_to_visitor: dict[int, str] = field(default_factory=dict)  # local track_id -> visitor_id
     last_seen_y: dict[int, float] = field(default_factory=dict)
-    # First y observed for each track id. Used by the warm-up branch of
-    # _crossed_entry_line: a track that first appears on the inside of the
-    # entry line (within the entry-camera x_range) is attributed to a crossing
-    # that happened in the frames we skipped between samples.
-    warmed_up: set[int] = field(default_factory=set)
     track_lost_at: dict[int, datetime] = field(default_factory=dict)
-    # ENTRY events emitted within the last 2 s, kept as references so we can
-    # back-stamp metadata.group_size when more arrivals land in the same
-    # window. Tuples: (ts, event_dict).
-    recent_entries_for_grouping: list[tuple[datetime, dict]] = field(default_factory=list)
+    # ENTRY events held back from emission until the 2-second group window
+    # closes. Tuples: (ts, event_dict). Once GROUP_WINDOW_S passes since the
+    # last arrival, the whole batch flushes atomically with the final
+    # group_size — this avoids a race where the emitter's batch flush could
+    # ship some events with `group_size=N` and others with `group_size=N+1`.
+    pending_group: list[tuple[datetime, dict]] = field(default_factory=list)
 
 
 @dataclass
@@ -81,11 +78,12 @@ def clip_start(clip_path: Path) -> datetime:
     file.
 
     We hash the filename into a deterministic minute-offset from the configured
-    PIPELINE_CLIP_START anchored at *midnight UTC of the base day*, capped at
-    4 hours of spread. Anchoring at midnight + a 0..4h spread guarantees every
-    clip from a single run lands on the same calendar day — important because
-    the dashboard's "today window" pins to that day, and an offset that wraps
-    across midnight would silently split metrics across two days.
+    PIPELINE_CLIP_START's hour-of-day on the base date, capped at 4 hours of
+    spread. Anchoring at the base time + a 0..4h spread guarantees every clip
+    from a single run lands on the same calendar day (the dashboard's "today
+    window" pins to that day) AND overlaps the POS CSV's afternoon hours —
+    without that overlap the 5-minute purchase-correlation window never
+    matches.
 
     Determinism: `name_hash` is the digest of the filename (not Python's salted
     `hash()`), so reruns of the same input produce the same timestamps and
@@ -94,11 +92,10 @@ def clip_start(clip_path: Path) -> datetime:
     import hashlib
 
     base = datetime.fromisoformat(CONFIG.default_clip_start_iso.replace("Z", "+00:00"))
-    midnight = base.replace(hour=0, minute=0, second=0, microsecond=0)
     digest = hashlib.sha256(clip_path.name.encode("utf-8")).digest()
     name_hash = int.from_bytes(digest[:8], "big")
     h = name_hash % (60 * 4)  # minute offset, 0..4h — same day guaranteed
-    return midnight + timedelta(minutes=h)
+    return base + timedelta(minutes=h)
 
 
 def detect_to_ts(start: datetime, frame_idx: int) -> datetime:
@@ -109,33 +106,104 @@ def _new_visitor_id() -> str:
     return f"VIS_{uuid.uuid4().hex[:8]}"
 
 
+# How long a bootstrap-synthetic visitor must continue to be tracked before
+# we promote them to an emitted ENTRY event. Anything shorter is most likely
+# a ByteTrack flap or an edge-of-frame partial detection — emitting an ENTRY
+# for those inflated visitor counts (Store 1 had 14 phantom synthetics from
+# till-area flaps before this gate was added).
+BOOTSTRAP_PROMOTE_S = 1.5
+
+# Co-arrival window for group_size annotation. ENTRY events that land
+# within this many seconds of each other share a group_size (count of
+# arrivals in the window). The window is held atomically: events are
+# released to the emitter only after `GROUP_WINDOW_S` has passed since the
+# last arrival, so the emitted group_size is final at flush time.
+GROUP_WINDOW_S = 2.0
+
+
+def _flush_expired_group(cs: "CameraState", now: datetime, emitter: "EventEmitter") -> None:
+    """Release held ENTRY/REENTRY events whose group window has closed.
+
+    The group window closes when the most-recent pending event is older than
+    GROUP_WINDOW_S — i.e. no further arrivals could still join this group.
+    On flush we re-stamp every event in the group with the final
+    group_size (the window's full count) and hand the batch to the emitter
+    in arrival order.
+    """
+    if not cs.pending_group:
+        return
+    last_ts = cs.pending_group[-1][0]
+    if (now - last_ts).total_seconds() < GROUP_WINDOW_S:
+        return
+    final_size = len(cs.pending_group)
+    for _, ev in cs.pending_group:
+        ev["metadata"]["group_size"] = final_size
+        emitter.add(ev)
+    cs.pending_group.clear()
+
+
+def _flush_all_pending_groups(state: "PipelineState", emitter: "EventEmitter") -> None:
+    """End-of-clip safety net: flush every camera's held group regardless of
+    window. Called once when a clip finishes."""
+    for cs in state.cam_state.values():
+        if not cs.pending_group:
+            continue
+        final_size = len(cs.pending_group)
+        for _, ev in cs.pending_group:
+            ev["metadata"]["group_size"] = final_size
+            emitter.add(ev)
+        cs.pending_group.clear()
+
+
+def _maybe_promote_pending_entry(
+    state: "PipelineState",
+    sess: "VisitorSession",
+    cam_id: str,
+    ts: datetime,
+    confidence: float,
+    emitter: "EventEmitter",
+) -> None:
+    """If `sess` has a pending bootstrap-synthetic ENTRY and the track has
+    persisted at least `BOOTSTRAP_PROMOTE_S` seconds, emit it now using the
+    original bootstrap timestamp so the event timeline stays honest. Clears
+    the pending state on emit. No-op if there's no pending entry or the
+    persistence threshold hasn't been reached yet."""
+    pending = sess.pending_entry_ts
+    if pending is None:
+        return
+    if (ts - pending).total_seconds() < BOOTSTRAP_PROMOTE_S:
+        return
+    emitter.add(build_event(
+        store_id=state.layout.store_id,
+        camera_id=cam_id,
+        visitor_id=sess.visitor_id,
+        event_type="ENTRY",
+        ts=pending,
+        is_staff=sess.is_staff,
+        confidence=confidence,
+        session_seq=sess.next_seq(),
+    ))
+    sess.pending_entry_ts = None
+
+
 def _crossed_entry_line(
     prev_y: Optional[float],
     cur_y: float,
     line: dict,
-    *,
-    first_seen: bool = False,
 ) -> str | None:
     """Return 'ENTRY' or 'EXIT' if the line was crossed this frame.
 
-    If `first_seen` is true the track had no previous observation in the entry
-    corridor — we attribute the missing crossing to a skipped frame and treat
-    a current-position-on-the-inside as a fresh ENTRY. (We never synthesise
-    EXITs from the warm-up branch: a track that vanishes after exiting was
-    already gated on a real prev_y < threshold sample.)"""
-    if line is None:
+    A track must have been observed in the corridor for at least one prior
+    frame before it can produce a crossing. Tracks that first appear *past*
+    the threshold do NOT count as ENTRY — without a prior position we can't
+    distinguish "stepped through the door" from "walked past the storefront
+    on the outside aisle". Entry cameras run at stride=1, so every real
+    crossing has at least two samples to inspect.
+    """
+    if line is None or prev_y is None:
         return None
     yt = float(line.get("y_threshold", 0.5))
     inbound = line.get("inbound_direction", "down")
-    if prev_y is None:
-        if not first_seen:
-            return None
-        # Warm-up: first observation past the line is treated as ENTRY.
-        if inbound == "down" and cur_y >= yt:
-            return "ENTRY"
-        if inbound == "up" and cur_y <= yt:
-            return "ENTRY"
-        return None
     if inbound == "down":
         if prev_y < yt <= cur_y:
             return "ENTRY"
@@ -159,6 +227,8 @@ def process_entry_camera(
     emitter: "EventEmitter",
 ) -> None:
     cs = state.cam_state[cam_id]
+    # Release any held group whose window has now closed.
+    _flush_expired_group(cs, ts, emitter)
     line = cam.entry_line or {}
     x_lo, x_hi = (line.get("x_range") or [0.0, 1.0])
 
@@ -175,14 +245,8 @@ def process_entry_camera(
             cs.last_seen_y[tid] = cy
             continue
         prev_y = cs.last_seen_y.get(tid)
-        # First time we see this track inside the entry corridor: attribute
-        # any missing crossing to a frame we skipped (frame_stride > 1 can
-        # easily skip a sub-second crossing). After the first sample we have
-        # a real prev_y and the standard threshold-cross logic takes over.
-        first_seen = tid not in cs.warmed_up
-        crossing = _crossed_entry_line(prev_y, cy, line, first_seen=first_seen)
+        crossing = _crossed_entry_line(prev_y, cy, line)
         cs.last_seen_y[tid] = cy
-        cs.warmed_up.add(tid)
         if not crossing:
             continue
 
@@ -210,21 +274,22 @@ def process_entry_camera(
             sess.is_staff = state.staff.classify(visitor_id, crop_bgr=crop)
             seq = sess.next_seq()
 
-            # ----- group_size: back-stamp prior ENTRY/REENTRY events ---------
-            # Drop entries older than 2 s, then count what remains plus this
-            # one. The group_size we stamp on this event is "how many people
-            # had arrived within the 2-second window at the moment I emitted".
-            # We also back-stamp the in-window prior events so they all share
-            # the final count — works as long as none of them have flushed
-            # yet (typical batch_size is 200, group windows are <5 events).
-            window = [
-                (et, ev) for et, ev in cs.recent_entries_for_grouping
-                if (ts - et).total_seconds() <= 2.0
-            ]
-            group_size = len(window) + 1
-            for _, prior_ev in window:
-                prior_ev["metadata"]["group_size"] = group_size
-            cs.recent_entries_for_grouping = window
+            # ----- group_size: hold this ENTRY in the pending group ----------
+            # If the most-recent pending event is within the 2-second window
+            # this arrival joins it (group grows). Otherwise this is the
+            # start of a new group — flush the previous one atomically and
+            # begin fresh. Holding events until the window closes means
+            # group_size is final at emit time, no back-stamping race.
+            if cs.pending_group:
+                last_pending_ts = cs.pending_group[-1][0]
+                if (ts - last_pending_ts).total_seconds() > GROUP_WINDOW_S:
+                    # Previous group has closed — release it before opening
+                    # the new one.
+                    final_size = len(cs.pending_group)
+                    for _, prior_ev in cs.pending_group:
+                        prior_ev["metadata"]["group_size"] = final_size
+                        emitter.add(prior_ev)
+                    cs.pending_group.clear()
 
             event = build_event(
                 store_id=state.layout.store_id,
@@ -235,10 +300,10 @@ def process_entry_camera(
                 is_staff=sess.is_staff,
                 confidence=det.confidence,
                 session_seq=seq,
-                group_size=group_size,
+                # Provisional; real value stamped at flush time.
+                group_size=0,
             )
-            cs.recent_entries_for_grouping.append((ts, event))
-            emitter.add(event)
+            cs.pending_group.append((ts, event))
             state.recent_entries.append((ts, visitor_id, cx, cy, cam.overlap_with))
         else:  # EXIT
             visitor_id = cs.track_to_visitor.pop(tid, None)
@@ -249,7 +314,9 @@ def process_entry_camera(
             sess = state.sessions.get(visitor_id)
             if sess is None:
                 continue
-            # Close any open zone dwells first
+            # Close any open zone dwells first. Each ZONE_EXIT carries the
+            # rolling min confidence of its dwell, not the entry-camera
+            # detection's confidence — those are different signals.
             for zone_id, zd in list(sess.zone_dwells.items()):
                 dwell_ms = int((ts - zd.enter_ts).total_seconds() * 1000)
                 emitter.add(build_event(
@@ -261,7 +328,7 @@ def process_entry_camera(
                     zone_id=zone_id,
                     dwell_ms=dwell_ms,
                     is_staff=sess.is_staff,
-                    confidence=det.confidence,
+                    confidence=zd.min_confidence,
                     session_seq=sess.next_seq(),
                 ))
                 sess.zone_dwells.pop(zone_id, None)
@@ -322,6 +389,10 @@ def process_floor_camera(
                 zd = sess.zone_dwells.pop(zone_id, None)
                 if zd:
                     dwell_ms = int((ts - zd.enter_ts).total_seconds() * 1000)
+                    # Track is gone — no current detection to reference. Use
+                    # the rolling min observed during the dwell so the
+                    # emitted confidence still reflects the worst-quality
+                    # frame seen, rather than a hardcoded marker.
                     emitter.add(build_event(
                         store_id=state.layout.store_id,
                         camera_id=cam_id,
@@ -331,7 +402,7 @@ def process_floor_camera(
                         zone_id=zone_id,
                         dwell_ms=dwell_ms,
                         is_staff=sess.is_staff,
-                        confidence=0.6,
+                        confidence=zd.min_confidence,
                         session_seq=sess.next_seq(),
                     ))
                 sess.current_zone = None
@@ -339,16 +410,14 @@ def process_floor_camera(
     for tid, det in detections.items():
         cx, cy = det.cx_norm, det.cy_norm
         visitor_id = cs.track_to_visitor.get(tid)
-        bootstrapped = False
         if visitor_id is None:
             visitor_id = _adopt_floor_track(state, cam_id, cx, cy, ts)
             if visitor_id is None:
-                # Floor track with no associated entry — treat as "in-store" visitor
-                # bootstrapped on this camera (e.g. clip starts mid-store, or
-                # the entry-camera missed the crossing entirely). We must emit
-                # an ENTRY for them below; without it the funnel cascade
-                # (`zone_visited &= entered`) silently drops every legitimate
-                # zone-visiting visitor that came in this way.
+                # Floor track with no associated entry — treat as "in-store"
+                # visitor bootstrapped on this camera (clip started mid-store,
+                # or the entry-camera missed the crossing). Stage a pending
+                # synthetic ENTRY but don't emit it yet — a track that
+                # disappears within BOOTSTRAP_PROMOTE_S is a ByteTrack flap.
                 emb = state.reid.compute_embedding(crops.get(tid))
                 existing = state.reid.match(emb, ts)
                 if existing:
@@ -357,8 +426,11 @@ def process_floor_camera(
                 else:
                     visitor_id = _new_visitor_id()
                     state.reid.add(visitor_id, emb, ts)
-                    state.sessions[visitor_id] = VisitorSession(visitor_id=visitor_id, entered_at=ts)
-                    bootstrapped = True
+                    state.sessions[visitor_id] = VisitorSession(
+                        visitor_id=visitor_id,
+                        entered_at=ts,
+                        pending_entry_ts=ts,
+                    )
             cs.track_to_visitor[tid] = visitor_id
 
         sess = state.sessions.get(visitor_id)
@@ -372,20 +444,12 @@ def process_floor_camera(
         if not sess.is_staff:
             sess.is_staff = state.staff.classify(visitor_id, crop_bgr=crops.get(tid))
 
-        if bootstrapped:
-            # Emit a synthetic ENTRY so the funnel sees this visitor. Confidence
-            # marked low to distinguish from real entry-line crossings; downstream
-            # consumers can filter on it if desired.
-            emitter.add(build_event(
-                store_id=state.layout.store_id,
-                camera_id=cam_id,
-                visitor_id=visitor_id,
-                event_type="ENTRY",
-                ts=ts,
-                is_staff=sess.is_staff,
-                confidence=0.4,
-                session_seq=sess.next_seq(),
-            ))
+        # Promote a pending bootstrap-synthetic ENTRY once the track has
+        # persisted long enough — silently drops sub-1.5s flaps. The promoted
+        # ENTRY uses the actual detection confidence at promotion time so the
+        # event reflects real signal quality (spec: "your detection
+        # confidence — do not suppress low-conf events").
+        _maybe_promote_pending_entry(state, sess, cam_id, ts, det.confidence, emitter)
 
         zone_id = find_zone((cx, cy), cam.zones)
 
@@ -395,6 +459,9 @@ def process_floor_camera(
                 zd = sess.zone_dwells.pop(sess.current_zone, None)
                 if zd:
                     dwell_ms = int((ts - zd.enter_ts).total_seconds() * 1000)
+                    # ZONE_EXIT confidence reflects the *exited* zone's worst
+                    # frame, not the new zone's first frame. The current
+                    # det.confidence belongs to the new zone.
                     emitter.add(build_event(
                         store_id=state.layout.store_id,
                         camera_id=cam_id,
@@ -404,11 +471,13 @@ def process_floor_camera(
                         zone_id=sess.current_zone,
                         dwell_ms=dwell_ms,
                         is_staff=sess.is_staff,
-                        confidence=det.confidence,
+                        confidence=zd.min_confidence,
                         session_seq=sess.next_seq(),
                     ))
             if zone_id is not None:
-                sess.zone_dwells[zone_id] = ZoneDwell(enter_ts=ts, last_emit_ts=ts)
+                zd = ZoneDwell(enter_ts=ts, last_emit_ts=ts)
+                zd.observe(det.confidence)
+                sess.zone_dwells[zone_id] = zd
                 emitter.add(build_event(
                     store_id=state.layout.store_id,
                     camera_id=cam_id,
@@ -423,25 +492,29 @@ def process_floor_camera(
                 ))
             sess.current_zone = zone_id
 
-        # Periodic ZONE_DWELL emission
+        # Periodic ZONE_DWELL emission. Record this frame's confidence into
+        # the dwell's rolling min so the next emission reflects worst-case
+        # signal quality, not just the current tick.
         if sess.current_zone is not None:
             zd = sess.zone_dwells.get(sess.current_zone)
-            if zd and (ts - zd.last_emit_ts).total_seconds() >= CONFIG.dwell_emit_sec:
-                dwell_ms = int((ts - zd.enter_ts).total_seconds() * 1000)
-                emitter.add(build_event(
-                    store_id=state.layout.store_id,
-                    camera_id=cam_id,
-                    visitor_id=visitor_id,
-                    event_type="ZONE_DWELL",
-                    ts=ts,
-                    zone_id=sess.current_zone,
-                    dwell_ms=dwell_ms,
-                    is_staff=sess.is_staff,
-                    confidence=det.confidence,
-                    sku_zone=sess.current_zone,
-                    session_seq=sess.next_seq(),
-                ))
-                zd.last_emit_ts = ts
+            if zd is not None:
+                zd.observe(det.confidence)
+                if (ts - zd.last_emit_ts).total_seconds() >= CONFIG.dwell_emit_sec:
+                    dwell_ms = int((ts - zd.enter_ts).total_seconds() * 1000)
+                    emitter.add(build_event(
+                        store_id=state.layout.store_id,
+                        camera_id=cam_id,
+                        visitor_id=visitor_id,
+                        event_type="ZONE_DWELL",
+                        ts=ts,
+                        zone_id=sess.current_zone,
+                        dwell_ms=dwell_ms,
+                        is_staff=sess.is_staff,
+                        confidence=zd.min_confidence,
+                        sku_zone=sess.current_zone,
+                        session_seq=sess.next_seq(),
+                    ))
+                    zd.last_emit_ts = ts
 
         sess.floor_dwell_seconds += 1.0 / CONFIG.fps
 
@@ -459,83 +532,150 @@ def process_billing_camera(
     qpoly = cam.queue_polygon or [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]
 
     in_queue: dict[int, str] = {}
+    # Per-visitor detection confidence captured this frame. The JOIN event
+    # uses this directly (the visitor IS being detected right now). The
+    # ABANDON path consumes it via `_billing_last_conf` so the emitted
+    # confidence still reflects the worst-quality frame we saw, rather than
+    # a hardcoded marker.
+    frame_conf: dict[str, float] = {}
     for tid, det in detections.items():
         if not point_in_polygon((det.cx_norm, det.cy_norm), qpoly):
             continue
         visitor_id = cs.track_to_visitor.get(tid)
         bootstrapped = False
         if visitor_id is None:
+            # 1) Cross-camera adoption via the entry-event window.
             adopted = _adopt_floor_track(state, cam_id, det.cx_norm, det.cy_norm, ts)
-            if adopted is None:
-                visitor_id = _new_visitor_id()
-                bootstrapped = True
-            else:
+            if adopted is not None:
                 visitor_id = adopted
+            else:
+                # 2) Re-ID lookup. ByteTrack drops + re-acquires tracks all the
+                #    time at the till (occlusion behind a counter, pose change,
+                #    bagging movement). Without this consultation each flap
+                #    would mint a fresh visitor_id and inflate the queue count
+                #    by 3-5x. The colour-histogram embedding is cheap and good
+                #    enough to bridge a few-second gap on the same person.
+                crop_for_match = crops.get(tid) if crops else None
+                emb = state.reid.compute_embedding(crop_for_match)
+                existing = state.reid.match(emb, ts)
+                if existing is not None:
+                    visitor_id = existing.visitor_id
+                    state.reid.update(existing, emb, ts)
+                else:
+                    # 3) Genuinely new identity — mint and stage a pending
+                    #    synthetic ENTRY. We defer the emit until the track
+                    #    has persisted >= BOOTSTRAP_PROMOTE_S, so brief
+                    #    ByteTrack flaps at the till never inflate the count.
+                    visitor_id = _new_visitor_id()
+                    state.reid.add(visitor_id, emb, ts)
+                    bootstrapped = True
             cs.track_to_visitor[tid] = visitor_id
             if visitor_id not in state.sessions:
-                state.sessions[visitor_id] = VisitorSession(visitor_id=visitor_id, entered_at=ts)
+                state.sessions[visitor_id] = VisitorSession(
+                    visitor_id=visitor_id,
+                    entered_at=ts,
+                    pending_entry_ts=ts if bootstrapped else None,
+                )
+            elif bootstrapped:
+                state.sessions[visitor_id].pending_entry_ts = ts
         # Upgrade-only staff classification.
         sess = state.sessions[visitor_id]
         if not sess.is_staff and crops is not None:
             sess.is_staff = state.staff.classify(visitor_id, crop_bgr=crops.get(tid))
-        if bootstrapped:
-            # Synthetic ENTRY so this billing-zone visitor isn't filtered out
-            # of the funnel cascade (`billing_joined &= entered`). The billing
-            # camera missed having an entry-cam predecessor — most likely the
-            # entry-line crossing was outside the 3s overlap window or the
-            # entry cam didn't see them at all.
-            emitter.add(build_event(
-                store_id=state.layout.store_id,
-                camera_id=cam_id,
-                visitor_id=visitor_id,
-                event_type="ENTRY",
-                ts=ts,
-                is_staff=sess.is_staff,
-                confidence=0.4,
-                session_seq=sess.next_seq(),
-            ))
+        # Promote a staged synthetic ENTRY once the track has lasted long
+        # enough (silently drops sub-1.5s flaps). Use the actual detection
+        # confidence so the event reflects the true signal quality.
+        _maybe_promote_pending_entry(state, sess, cam_id, ts, det.confidence, emitter)
         in_queue[tid] = visitor_id
+        # Keep the worst (lowest) confidence we see per visitor this frame —
+        # if a visitor is detected in two overlapping bboxes the conservative
+        # value better reflects "how confident are we this person exists".
+        prev = frame_conf.get(visitor_id)
+        if prev is None or det.confidence < prev:
+            frame_conf[visitor_id] = float(det.confidence)
 
     queue_depth = len(in_queue)
 
-    # JOIN events for newly-arrived visitors
-    prior = set(getattr(cs, "_billing_prev", set()))
-    current = set(in_queue.values())
-    joined = current - prior
-    abandoned = prior - current
-    for visitor_id in joined:
-        sess = state.sessions[visitor_id]
-        sess.visited_billing = True
-        emitter.add(build_event(
-            store_id=state.layout.store_id,
-            camera_id=cam_id,
-            visitor_id=visitor_id,
-            event_type="BILLING_QUEUE_JOIN",
-            ts=ts,
-            zone_id="BILLING",
-            is_staff=sess.is_staff,
-            confidence=0.85,
-            queue_depth=queue_depth,
-            session_seq=sess.next_seq(),
-        ))
-    for visitor_id in abandoned:
-        sess = state.sessions.get(visitor_id)
+    # JOIN/ABANDON debouncing.
+    # ByteTrack drops + the queue polygon's edge produce per-frame "flaps":
+    # the same person at the till blinks in and out of the queue set,
+    # generating JOIN→ABANDON→JOIN pairs every few hundred ms. We collapse
+    # these by:
+    #   - Requiring `JOIN_COOLDOWN_S` between consecutive JOINs for the
+    #     same visitor (so a flap doesn't double-count).
+    #   - Requiring `ABANDON_GAP_S` of continuous absence before emitting
+    #     ABANDON (so a momentary track loss doesn't read as walking off).
+    JOIN_COOLDOWN_S = 30.0
+    ABANDON_GAP_S = 5.0
+
+    last_join: dict[str, datetime] = getattr(cs, "_billing_last_join", {})
+    last_seen: dict[str, datetime] = getattr(cs, "_billing_last_seen", {})
+    last_conf: dict[str, float] = getattr(cs, "_billing_last_conf", {})
+    in_queue_set: set[str] = set(in_queue.values())
+
+    # Update last-seen + last-confidence for visitors currently in the queue.
+    for vid in in_queue_set:
+        last_seen[vid] = ts
+        if vid in frame_conf:
+            last_conf[vid] = frame_conf[vid]
+
+    # JOIN: visitor present this frame and either never JOINed or last JOIN
+    # was longer than the cooldown ago. Confidence reflects the actual
+    # detection in the queue polygon.
+    for vid in in_queue_set:
+        prior_join = last_join.get(vid)
+        if prior_join is None or (ts - prior_join).total_seconds() >= JOIN_COOLDOWN_S:
+            sess = state.sessions[vid]
+            sess.visited_billing = True
+            emitter.add(build_event(
+                store_id=state.layout.store_id,
+                camera_id=cam_id,
+                visitor_id=vid,
+                event_type="BILLING_QUEUE_JOIN",
+                ts=ts,
+                zone_id="BILLING",
+                is_staff=sess.is_staff,
+                confidence=frame_conf.get(vid, last_conf.get(vid, 0.5)),
+                queue_depth=queue_depth,
+                session_seq=sess.next_seq(),
+            ))
+            last_join[vid] = ts
+
+    # ABANDON: visitor was previously seen but hasn't been in the queue for
+    # at least ABANDON_GAP_S. Emit once, then drop them from tracking. The
+    # emitted confidence is the last-seen frame's confidence — the visitor
+    # has by definition just left the polygon, so there's no current
+    # detection to consult.
+    abandoned: list[str] = []
+    for vid, seen_at in list(last_seen.items()):
+        if vid in in_queue_set:
+            continue
+        if (ts - seen_at).total_seconds() >= ABANDON_GAP_S:
+            abandoned.append(vid)
+    for vid in abandoned:
+        sess = state.sessions.get(vid)
+        prior_conf = last_conf.pop(vid, 0.5)
+        last_seen.pop(vid, None)
+        last_join.pop(vid, None)
         if not sess:
             continue
-        # Treat as ABANDON if exit happened but POS correlation will resolve
         emitter.add(build_event(
             store_id=state.layout.store_id,
             camera_id=cam_id,
-            visitor_id=visitor_id,
+            visitor_id=vid,
             event_type="BILLING_QUEUE_ABANDON",
             ts=ts,
             zone_id="BILLING",
             is_staff=sess.is_staff,
-            confidence=0.7,
+            confidence=prior_conf,
             queue_depth=queue_depth,
             session_seq=sess.next_seq(),
         ))
-    cs._billing_prev = current  # type: ignore[attr-defined]
+
+    cs._billing_last_join = last_join   # type: ignore[attr-defined]
+    cs._billing_last_seen = last_seen   # type: ignore[attr-defined]
+    cs._billing_last_conf = last_conf   # type: ignore[attr-defined]
+    cs._billing_prev = in_queue_set     # type: ignore[attr-defined]
 
 
 def process_clip(
@@ -622,6 +762,10 @@ def process_clip(
             log.info("clip.max_frames_reached name=%s processed=%d", source_name, n_processed)
             break
 
+    # Release any ENTRY/REENTRY events still held in group windows. Without
+    # this, a group that arrived in the final 2 seconds of the clip would
+    # sit in cs.pending_group forever and never reach the API.
+    _flush_all_pending_groups(state, emitter)
     try:
         emitter.flush()
     except Exception:

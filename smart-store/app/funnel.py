@@ -69,10 +69,21 @@ async def funnel(store_id: str) -> FunnelResponse:
     }
     purchased = await visitors_who_purchased(store_id, start_iso, end_iso)
 
-    # Enforce the funnel cascade: each stage is a subset of the previous one.
-    zone_visited &= entered
-    billing_joined &= entered
+    # Enforce the funnel cascade strictly: each stage must be a subset of the
+    # previous one, with each stage's set INCLUDING anyone who reached a later
+    # stage. This handles two real-world artefacts:
+    #
+    #  - A visitor who joined the billing queue obviously also walked through
+    #    the store. They may not show a ZONE_ENTER record because the floor
+    #    camera missed them, but logically they're a Zone Visit too.
+    #  - A POS-matched purchaser must have queued at the till; same idea
+    #    applies upward through the funnel.
+    #
+    # Without this, stage counts can grow downstream (billing > zone), which
+    # produces nonsense drop-off% values like -400%.
     purchased &= entered
+    billing_joined = (billing_joined | purchased) & entered
+    zone_visited = (zone_visited | billing_joined) & entered
 
     counts = [
         ("Entry", len(entered)),

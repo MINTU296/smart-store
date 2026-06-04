@@ -34,12 +34,18 @@ class TrackIdentity:
     embedding: np.ndarray
     last_seen: datetime
     exited_at: Optional[datetime] = None
+    # When this identity was first added to the index. Used by the
+    # max-lifetime eviction in `match()` so a long-stayer's embedding
+    # doesn't sit in the index forever (and falsely match a similar-
+    # looking new arrival as a REENTRY).
+    created_at: Optional[datetime] = None
 
 
 @dataclass
 class ReIDIndex:
     threshold: float = CONFIG.reid_threshold
     reentry_window_sec: int = CONFIG.reentry_window_sec
+    max_lifetime_sec: int = CONFIG.reid_max_lifetime_sec
     identities: list[TrackIdentity] = field(default_factory=list)
 
     def compute_embedding(self, crop_bgr: np.ndarray) -> np.ndarray:
@@ -58,10 +64,32 @@ class ReIDIndex:
         norm = float(np.linalg.norm(v)) or 1.0
         return v / norm
 
+    def _evict_expired(self, now: datetime) -> None:
+        """Drop identities whose lifetime has exceeded `max_lifetime_sec`.
+
+        Without this, a visitor who entered hours ago and is still being
+        tracked stays eligible for embedding matches forever, so a
+        similarly-dressed new arrival much later can register as a false
+        REENTRY of that earlier session. The max-lifetime cap bounds that
+        false-positive window regardless of how recently the identity was
+        last observed.
+        """
+        if not self.identities:
+            return
+        lifetime_cutoff = now - timedelta(seconds=self.max_lifetime_sec)
+        self.identities = [
+            ident for ident in self.identities
+            if (ident.created_at is None or ident.created_at >= lifetime_cutoff)
+        ]
+
     def match(self, embedding: np.ndarray, now: datetime) -> Optional[TrackIdentity]:
         """Return the best-matching active identity, or None if all below threshold."""
         if embedding.size == 0:
             return None
+        # Evict identities that have outlived the max-lifetime cap before
+        # consulting the index — an over-aged embedding must not produce a
+        # match.
+        self._evict_expired(now)
         best: tuple[float, Optional[TrackIdentity]] = (-1.0, None)
         cutoff = now - timedelta(seconds=self.reentry_window_sec)
         for ident in self.identities:
@@ -75,7 +103,12 @@ class ReIDIndex:
         return None
 
     def add(self, visitor_id: str, embedding: np.ndarray, now: datetime) -> TrackIdentity:
-        ident = TrackIdentity(visitor_id=visitor_id, embedding=embedding, last_seen=now)
+        ident = TrackIdentity(
+            visitor_id=visitor_id,
+            embedding=embedding,
+            last_seen=now,
+            created_at=now,
+        )
         self.identities.append(ident)
         return ident
 

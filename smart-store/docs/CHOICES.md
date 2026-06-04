@@ -54,7 +54,7 @@ rather than facts.
    handling, not which model the question-writer assumed I'd use. My
    follow-up answer becomes: *"I started with YOLOv8n, observed the
    occlusion failures the question describes, swapped to v11n through the
-   same Ultralytics API (one config-line change at `pipeline/config.py:26`),
+   same Ultralytics API (one config-line change at `pipeline/config.py:41`),
    and kept ByteTrack's low-confidence promotion rule to recover what the
    detector still misses."* That's a strictly better story than defending a
    model I didn't actually choose.

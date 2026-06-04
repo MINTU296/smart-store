@@ -11,7 +11,7 @@ without grepping.
 |---|---|---|
 | §5.1 Detection (30 pts) — entry/exit accuracy, re-entry, staff, group entry, edge cases | §3.1 Detection layer + §6 follow-up plan | `pipeline/detect.py`, `pipeline/reid.py`, `pipeline/staff.py`, `pipeline/run.py` |
 | §5.2 API & business logic (35 pts) — endpoint correctness, session-based funnel, anomaly logic | §3.3 Ingestion + §3.4 Read endpoints | `app/ingestion.py`, `app/funnel.py`, `app/anomalies.py`, `app/metrics.py` |
-| §5.3 Production readiness (20 pts) — deployment, observability, testing | §5 Production-readiness checklist | `docker-compose.yml`, `app/logging_setup.py`, `tests/` (12 files, ≥76 % coverage) |
+| §5.3 Production readiness (20 pts) — deployment, observability, testing | §5 Production-readiness checklist | `docker-compose.yml`, `app/logging_setup.py`, `tests/` (12 files, ≥79 % coverage) |
 | §5.4 Engineering thinking (15 pts) — CHOICES, DESIGN, reasoning depth | §4 AI-Assisted Decisions + `docs/CHOICES.md` | `docs/CHOICES.md` (3 load-bearing decisions) |
 
 The acceptance gate (rubric §3) and integrity check (rubric §06) are
@@ -70,7 +70,7 @@ Kinesis/Kafka — the API does not change.
 
 ### 3.1 Detection layer (`pipeline/`)
 
-**Detector.** YOLOv11n via Ultralytics (`pipeline/config.py:26` → `yolo11n.pt`).
+**Detector.** YOLOv11n via Ultralytics (`pipeline/config.py:41` → `yolo11n.pt`).
 Reasons:
 - Runs without a GPU on the reviewer's machine; ~6 MB weights, same
   Ultralytics API surface as v8 — passes the acceptance gate ("`docker
@@ -248,7 +248,7 @@ Verbatim model output (compressed):
 > needs a GPU for sane FPS; CPU is single digits."
 
 **Decision: chose YOLOv11n** (config default `yolo11n.pt` at
-`pipeline/config.py:26`) — the newer generation in the same Ultralytics API,
+`pipeline/config.py:41`) — the newer generation in the same Ultralytics API,
 no extra cost at the acceptance gate, better partial-occlusion recall on the
 named billing-clip edge case. The spec's follow-up question literally names
 YOLOv8 ("what did you try when YOLOv8 struggled with the partial-occlusion
@@ -341,7 +341,7 @@ silently misrepresenting one as the other.
 | Structured logs | One JSON line per request: `trace_id, store_id, endpoint, method, latency_ms, event_count, status_code` |
 | Trace propagation | `x-trace-id` request header preserved or generated; echoed back in response |
 | Graceful degradation | DB unreachable → 503 with structured body; Redis unreachable → degraded counters, SQLite still serves reads |
-| Test coverage | `pytest --cov` reports ≥76 % (above the 70 % bar); 51 tests, edge cases enumerated below |
+| Test coverage | `pytest --cov` reports ≥79 % (above the 70 % bar); 68 tests, edge cases enumerated below |
 | Edge cases tested | empty store, all-staff, zero purchases, re-entry de-dup, idempotency, batch >500, malformed event, POS at exactly 5 min boundary |
 | README | 5-command setup; explains how to run pipeline against the supplied clips |
 

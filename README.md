@@ -68,8 +68,12 @@ store-intelligence/
 ├── dashboard-src/        # React + Vite + TS source for the live UI
 ├── dashboard/            # Built React bundle (served by FastAPI)
 ├── store_layouts/        # Per-store zone polygons
-├── tests/                # 51 tests, ≥76 % coverage
+├── data/                 # Sample clips + POS CSV
+├── scripts/              # smoke.sh, build_smoke_fixture.py, debug_staff.py
+├── tests/                # 68 tests, ≥79 % coverage
 ├── docs/                 # DESIGN.md + CHOICES.md
+├── Makefile              # smoke / up / down / seed / test / pipeline
+├── pyproject.toml
 ├── docker-compose.yml
 ├── Dockerfile.api
 └── Dockerfile.pipeline

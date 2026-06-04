@@ -72,6 +72,28 @@ def test_reid_match_and_reentry():
     assert idx.is_reentry(ident, later) is True
 
 
+def test_reid_evicts_identities_past_max_lifetime():
+    """A long-stayer's embedding must be evicted from the index once it
+    has lived longer than `max_lifetime_sec`, so a similarly-dressed new
+    arrival doesn't falsely register as a REENTRY of that earlier session.
+
+    Without eviction, a customer who entered at t=0 and is still being
+    tracked at t=4h+ keeps their embedding alive in the index forever:
+    any new arrival in similar clothing would match the stale embedding
+    and emit a false REENTRY event with the old visitor_id."""
+    idx = ReIDIndex(threshold=0.8, reentry_window_sec=86400, max_lifetime_sec=2700)
+    t0 = datetime(2026, 3, 8, 10, 0, 0, tzinfo=timezone.utc)
+    emb = np.ones(96, dtype=np.float32) / np.sqrt(96)
+    idx.add("VIS_long_stayer", emb, t0)
+    # Within the lifetime cap → match still works.
+    t_mid = datetime(2026, 3, 8, 10, 30, 0, tzinfo=timezone.utc)
+    assert idx.match(emb, t_mid) is not None
+    # Past the lifetime cap → identity gone, no match.
+    t_late = datetime(2026, 3, 8, 11, 0, 0, tzinfo=timezone.utc)  # 1h after add
+    assert idx.match(emb, t_late) is None
+    assert idx.identities == [], "expired identity should have been evicted"
+
+
 def test_entry_line_crossing_directions():
     line_down = {"y_threshold": 0.5, "inbound_direction": "down"}
     assert _crossed_entry_line(0.4, 0.6, line_down) == "ENTRY"

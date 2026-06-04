@@ -83,30 +83,53 @@ def test_behaviour_fallback_catches_staff_without_crop():
     assert sc.classify("V_b_1", crop_bgr=None, dwell_seconds_in_floor=21 * 60, visited_billing=False) is True
 
 
-def test_classify_is_cached_after_persistence(monkeypatch):
-    """Once min_consecutive_matches True samples have flipped the cache to
-    True, a subsequent classify() must be a pure cache read — no further
-    HSV work."""
+def test_staff_downgrade_when_uniform_disappears():
+    """Customer in dark hoodie at Store 1: passes 3 black frames, gets pinned
+    as staff. Then they remove the hoodie and show a bright top for 5+ frames
+    — the classifier must downgrade is_staff back to False, not stay
+    permanently misclassified.
+
+    This is the symmetric counterpart to the upgrade-only behaviour: false
+    positives (customer wearing dark layer) must be recoverable as soon as
+    the signal disappears. Without this, every dark-clothed customer at a
+    Store-1-style all-black-uniform location is permanently mislabelled."""
     sc = StaffClassifier()
     sc.set_store("STORE_BLR_001")
-    calls = {"n": 0}
+    black = _crop((10, 10, 10), (15, 15, 15))
+    bright = _crop((250, 250, 250), (250, 250, 250))  # clear non-uniform
+    # Drive into True via the persistence threshold.
+    for _ in range(sc.min_consecutive_matches):
+        sc.classify("V_dg", crop_bgr=black)
+    assert sc.cache["V_dg"] is True
+    # First few non-matching frames don't immediately downgrade — symmetric
+    # persistence required.
+    for i in range(sc.min_consecutive_disagreements - 1):
+        assert sc.classify("V_dg", crop_bgr=bright) is True, \
+            f"frame {i}: must still report staff before downgrade threshold"
+    # Threshold reached → downgrade.
+    assert sc.classify("V_dg", crop_bgr=bright) is False
+    assert sc.cache["V_dg"] is False
+    # And once downgraded, further bright frames keep them as customer.
+    assert sc.classify("V_dg", crop_bgr=bright) is False
 
-    real = sc._uniform_match
 
-    def counted(crop_bgr):
-        calls["n"] += 1
-        return real(crop_bgr)
-
-    monkeypatch.setattr(sc, "_uniform_match", counted)
+def test_classify_returns_cached_verdict_without_recomputing_signal(monkeypatch):
+    """Once promoted to staff, classify() returns True quickly. The
+    classifier still runs _uniform_match to detect a possible downgrade
+    (customer wearing dark hoodie removes it), but the verdict stays True
+    as long as the uniform keeps matching — no flapping, no extra work
+    beyond the cheap HSV mask."""
+    sc = StaffClassifier()
+    sc.set_store("STORE_BLR_001")
     crop = _crop((10, 10, 10), (10, 10, 10))
     # Drive the classifier through the persistence threshold.
     for _ in range(sc.min_consecutive_matches):
         sc.classify("V_cache", crop_bgr=crop)
-    n_before = calls["n"]
-    # Cache hit — no more _uniform_match calls.
-    sc.classify("V_cache", crop_bgr=crop)
-    sc.classify("V_cache", crop_bgr=crop)
-    assert calls["n"] == n_before
+    # Once cached True, subsequent matching crops keep returning True
+    # without flipping the cache.
+    assert sc.classify("V_cache", crop_bgr=crop) is True
+    assert sc.classify("V_cache", crop_bgr=crop) is True
+    assert sc.cache["V_cache"] is True
 
 
 def test_vlm_dry_run_writes_audit_for_ambiguous_crops(tmp_path, monkeypatch):

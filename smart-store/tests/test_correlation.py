@@ -67,3 +67,120 @@ def test_correlation_at_window_boundary(client):
     _run(_insert_pos(990003, "2026-03-08T11:05:00Z"))  # exactly 5min
     converted = _run(visitors_who_purchased(STORE, "2026-03-08T00:00:00Z", "2026-03-08T23:59:59Z", window_sec=300))
     assert "V3" in converted, "exactly window_sec must count as inside"
+
+
+def test_load_pos_csv_remaps_store_id_and_date(tmp_path, monkeypatch, client):
+    """The supplied CSV ships rows keyed by 'ST1008' on 10-04-2026, but the
+    pipeline emits events under STORE_BLR_001 anchored at 2026-03-08. The
+    POS_STORE_ID_MAP and POS_DATE_REMAP_TO env vars rewrite each row at
+    load time so the correlation actually has matching keys to join."""
+    from app import config as config_mod
+    from app.pos import load_pos_csv
+
+    csv_path = tmp_path / "pos_remap.csv"
+    csv_path.write_text(
+        "order_id,order_date,order_time,store_id,product_id,brand_name,total_amount\n"
+        "9001,10-04-2026,12:15:05,ST1008,123,Faces Canada,302.33\n"
+        "9002,10-04-2026,12:42:18,ST1008,456,Renee,199.00\n"
+    )
+
+    monkeypatch.setenv("POS_CSV_PATH", str(csv_path))
+    monkeypatch.setenv("POS_STORE_ID_MAP", '{"ST1008":"STORE_BLR_001"}')
+    monkeypatch.setenv("POS_DATE_REMAP_TO", "2026-03-08")
+    monkeypatch.setenv("POS_SPLIT_ACROSS_STORES", "[]")
+    config_mod.get_settings.cache_clear()
+
+    n = _run(load_pos_csv())
+    assert n == 2
+
+    async def _read():
+        async with Database.instance().cursor() as cur:
+            await cur.execute(
+                "SELECT order_id, store_id, ts FROM pos_transactions "
+                "WHERE order_id IN (9001, 9002) ORDER BY order_id"
+            )
+            rows = await cur.fetchall()
+            return [tuple(r) for r in rows]
+
+    rows = _run(_read())
+    assert rows[0] == (9001, "STORE_BLR_001", "2026-03-08T12:15:05Z")
+    assert rows[1] == (9002, "STORE_BLR_001", "2026-03-08T12:42:18Z")
+    config_mod.get_settings.cache_clear()
+
+
+def test_load_pos_csv_passthrough_when_no_translation(tmp_path, monkeypatch, client):
+    """With both env vars unset, store_id and ts are written verbatim — the
+    production code path for a real CSV that already uses canonical keys."""
+    from app import config as config_mod
+    from app.pos import load_pos_csv
+
+    csv_path = tmp_path / "pos_passthrough.csv"
+    csv_path.write_text(
+        "order_id,order_date,order_time,store_id,product_id,brand_name,total_amount\n"
+        "9101,08-03-2026,11:00:00,STORE_BLR_001,789,X,42.00\n"
+    )
+
+    monkeypatch.setenv("POS_CSV_PATH", str(csv_path))
+    monkeypatch.setenv("POS_STORE_ID_MAP", "")
+    monkeypatch.setenv("POS_DATE_REMAP_TO", "")
+    monkeypatch.setenv("POS_SPLIT_ACROSS_STORES", "[]")
+    config_mod.get_settings.cache_clear()
+
+    n = _run(load_pos_csv())
+    assert n == 1
+
+    async def _read():
+        async with Database.instance().cursor() as cur:
+            await cur.execute(
+                "SELECT store_id, ts FROM pos_transactions WHERE order_id = 9101"
+            )
+            rows = await cur.fetchall()
+            return [tuple(r) for r in rows]
+
+    rows = _run(_read())
+    assert rows == [("STORE_BLR_001", "2026-03-08T11:00:00Z")]
+    config_mod.get_settings.cache_clear()
+
+
+def test_load_pos_csv_split_across_stores(tmp_path, monkeypatch, client):
+    """When POS_SPLIT_ACROSS_STORES is set, rows are deterministically
+    distributed across the listed store ids by order_id parity. The fixture
+    CSV only ships with ST1008 — this is the demo-only path that gives both
+    Store 1 and Store 2 a coherent slice of POS data so neither shows
+    Purchase=0 by accident of the dataset."""
+    from app import config as config_mod
+    from app.pos import load_pos_csv
+
+    csv_path = tmp_path / "pos_split.csv"
+    csv_path.write_text(
+        "order_id,order_date,order_time,store_id,product_id,brand_name,total_amount\n"
+        "1,08-03-2026,11:00:00,ST1008,1,X,10.00\n"   # even → STORE_BLR_002
+        "2,08-03-2026,11:01:00,ST1008,1,X,10.00\n"   # even → STORE_BLR_001 (idx 0)
+        "3,08-03-2026,11:02:00,ST1008,1,X,10.00\n"   # odd → STORE_BLR_002
+        "4,08-03-2026,11:03:00,ST1008,1,X,10.00\n"   # even → STORE_BLR_001
+    )
+
+    monkeypatch.setenv("POS_CSV_PATH", str(csv_path))
+    monkeypatch.setenv("POS_STORE_ID_MAP", '{"ST1008":"STORE_BLR_001"}')
+    monkeypatch.setenv("POS_DATE_REMAP_TO", "")
+    monkeypatch.setenv(
+        "POS_SPLIT_ACROSS_STORES", '["STORE_BLR_001","STORE_BLR_002"]'
+    )
+    config_mod.get_settings.cache_clear()
+
+    n = _run(load_pos_csv())
+    assert n == 4
+
+    async def _read():
+        async with Database.instance().cursor() as cur:
+            await cur.execute(
+                "SELECT store_id, COUNT(*) AS n FROM pos_transactions "
+                "WHERE order_id BETWEEN 1 AND 4 GROUP BY store_id ORDER BY store_id"
+            )
+            rows = await cur.fetchall()
+            return [(r["store_id"], r["n"]) for r in rows]
+
+    rows = _run(_read())
+    # Both stores get exactly 2 rows — split is deterministic by order_id parity
+    assert rows == [("STORE_BLR_001", 2), ("STORE_BLR_002", 2)]
+    config_mod.get_settings.cache_clear()

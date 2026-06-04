@@ -59,19 +59,23 @@ def test_insights_empty_store(client):
 
 
 def test_insights_cameras_with_stale_flag(client):
-    # Two cameras: one recent (will be stale because clip date is 2026-03), one ancient
+    # B-1: stale flag is anchored on the freshest event ts for the store, not
+    # wall clock. Two cameras: CAM_ENTRY at the anchor minute, CAM_ZONE_1 a few
+    # hours earlier — only CAM_ZONE_1 should be flagged stale (>10 min old vs
+    # the anchor). Both being stale would reproduce the original bug where
+    # historical-clip runs marked every camera dead.
     events = [
         _e(event_id="ic01", visitor_id="V1", event_type="ENTRY",
-           camera_id="CAM_ENTRY", timestamp="2026-03-08T10:00:00Z"),
+           camera_id="CAM_ENTRY", timestamp="2026-03-08T18:00:00Z"),
         _e(event_id="ic02", visitor_id="V1", event_type="ZONE_ENTER",
            camera_id="CAM_ZONE_1", zone_id="MAKEUP", timestamp="2026-03-08T10:00:30Z"),
     ]
     _post(client, events)
     body = client.get(f"/stores/{STORE}/insights").json()
-    cam_ids = {c["camera_id"] for c in body["cameras"]}
-    assert {"CAM_ENTRY", "CAM_ZONE_1"} <= cam_ids
-    # Both events are months old → stale
-    assert all(c["stale"] for c in body["cameras"])
+    cams = {c["camera_id"]: c for c in body["cameras"]}
+    assert {"CAM_ENTRY", "CAM_ZONE_1"} <= set(cams)
+    assert cams["CAM_ENTRY"]["stale"] is False, "freshest camera should not be stale"
+    assert cams["CAM_ZONE_1"]["stale"] is True, "8-hour-old camera should be stale"
     roles = {c["camera_id"]: c["role"] for c in body["cameras"]}
     assert roles["CAM_ENTRY"] == "entry"
     assert roles["CAM_ZONE_1"] == "floor"

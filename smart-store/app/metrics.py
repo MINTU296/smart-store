@@ -28,9 +28,16 @@ def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
-async def _today_window(store_id: str) -> tuple[str, str]:
-    """Return [start, end] ISO strings for "today" — driven by the latest event
-    ts in the events table for this store, falling back to wall clock.
+async def now_for_store(store_id: str) -> datetime:
+    """Return the "current time" for this store — anchored on the latest event
+    timestamp in the events table, falling back to wall clock if the store has
+    no events yet.
+
+    Reviewers run the pipeline against historical clips (anchored at 2026-03-08
+    in the supplied data); using `datetime.now(utc)` for "now" in /health,
+    /anomalies, /insights makes every store look stale and every zone dead.
+    All read-side endpoints share this anchor so STALE_FEED, DEAD_ZONE, and
+    queue-spike windows agree with /metrics' notion of "today".
     """
     db = Database.instance()
     rows = await db.execute(
@@ -41,13 +48,49 @@ async def _today_window(store_id: str) -> tuple[str, str]:
         s = last_ts.replace("Z", "+00:00")
         try:
             anchor = datetime.fromisoformat(s)
+            if anchor.tzinfo is None:
+                anchor = anchor.replace(tzinfo=timezone.utc)
+            return anchor
         except ValueError:
-            anchor = _now_utc()
+            pass
+    return _now_utc()
+
+
+async def _today_window(store_id: str) -> tuple[str, str]:
+    """Return [start, end] ISO strings for "today" for this store.
+
+    Anchored on the **busiest** day in the events table (the calendar day with
+    the most events for this store, breaking ties toward the more recent day).
+    Falls back to wall clock if the store has no events.
+
+    Why busiest-day rather than freshest-event-day: a single straggler event
+    crossing midnight (e.g. clip ends at 23:59:59Z, one ENTRY at 00:00:01Z next
+    day) would otherwise shift the entire window onto the new day and drop
+    every event from the actual main day. Reviewers run finite-length clips
+    that can land near a UTC midnight boundary; we'd rather summarise the day
+    where the activity happened.
+    """
+    db = Database.instance()
+    rows = await db.execute(
+        """
+        SELECT date(ts) AS d
+        FROM events
+        WHERE store_id = ?
+        GROUP BY d
+        ORDER BY COUNT(*) DESC, d DESC
+        LIMIT 1
+        """,
+        (store_id,),
+    )
+    day_str = rows[0]["d"] if rows else None
+    if day_str:
+        try:
+            day = datetime.strptime(day_str, "%Y-%m-%d").date()
+        except ValueError:
+            day = (await now_for_store(store_id)).date()
     else:
-        anchor = _now_utc()
-    if anchor.tzinfo is None:
-        anchor = anchor.replace(tzinfo=timezone.utc)
-    start = datetime.combine(anchor.date(), datetime.min.time(), tzinfo=timezone.utc)
+        day = (await now_for_store(store_id)).date()
+    start = datetime.combine(day, datetime.min.time(), tzinfo=timezone.utc)
     end = start + timedelta(days=1) - timedelta(microseconds=1)
     return start.isoformat().replace("+00:00", "Z"), end.isoformat().replace("+00:00", "Z")
 
@@ -91,17 +134,23 @@ async def metrics(store_id: str) -> MetricsResponse:
     )
     avg_dwell_per_zone = {r["zone_id"]: float(r["avg_dwell"] or 0.0) for r in dwell_rows}
 
-    # Live queue depth (Redis-backed; fall back to last seen BILLING_QUEUE_JOIN)
+    # Live queue depth (Redis-backed; fall back to last seen BILLING_QUEUE_JOIN
+    # in the last 15 minutes — without the time bound, a JOIN from days ago
+    # would surface as the "current" queue depth, which is worse than zero.
     current_queue = await RedisClient.get_queue_depth(store_id)
     if current_queue == 0:
+        anchor = await now_for_store(store_id)
+        cutoff_iso = (
+            (anchor - timedelta(minutes=15)).isoformat().replace("+00:00", "Z")
+        )
         q_rows = await db.execute(
             """
             SELECT json_extract(metadata, '$.queue_depth') AS q
             FROM events
-            WHERE store_id = ? AND event_type = 'BILLING_QUEUE_JOIN'
+            WHERE store_id = ? AND event_type = 'BILLING_QUEUE_JOIN' AND ts >= ?
             ORDER BY ts DESC LIMIT 1
             """,
-            (store_id,),
+            (store_id, cutoff_iso),
         )
         if q_rows and q_rows[0]["q"] is not None:
             try:
@@ -109,20 +158,23 @@ async def metrics(store_id: str) -> MetricsResponse:
             except (TypeError, ValueError):
                 current_queue = 0
 
-    # Abandonment rate
-    ab_rows = await db.execute(
+    # Abandonment rate — POS-correlated set arithmetic (PS3 §3.3 says ABANDON
+    # "Requires POS correlation"). Counting raw ABANDON / JOIN events would
+    # mark a visitor who briefly stepped out of the queue polygon and then
+    # paid via POS as abandoned. Instead: a visitor who joined but is NOT in
+    # the POS-correlated purchasing set has truly abandoned.
+    join_rows = await db.execute(
         """
-        SELECT
-          SUM(CASE WHEN event_type = 'BILLING_QUEUE_ABANDON' THEN 1 ELSE 0 END) AS ab,
-          SUM(CASE WHEN event_type = 'BILLING_QUEUE_JOIN' THEN 1 ELSE 0 END) AS jn
+        SELECT DISTINCT visitor_id
         FROM events
         WHERE store_id = ? AND ts >= ? AND ts <= ? AND is_staff = 0
+          AND event_type = 'BILLING_QUEUE_JOIN' AND visitor_id IS NOT NULL
         """,
         (store_id, start_iso, end_iso),
     )
-    ab = ab_rows[0]["ab"] or 0
-    jn = ab_rows[0]["jn"] or 0
-    abandonment_rate = (ab / jn) if jn > 0 else 0.0
+    joined: set[str] = {r["visitor_id"] for r in join_rows if r["visitor_id"]}
+    abandoned = joined - purchasing
+    abandonment_rate = (len(abandoned) / len(joined)) if joined else 0.0
 
     return MetricsResponse(
         store_id=store_id,

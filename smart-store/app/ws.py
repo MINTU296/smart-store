@@ -15,6 +15,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
+import uuid
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
@@ -24,14 +26,35 @@ from .metrics import metrics as metrics_endpoint
 
 router = APIRouter(tags=["ws"])
 log = logging.getLogger("api.ws")
+# Reuse the same logger/structure the HTTP RequestLogMiddleware uses so WS
+# snapshots don't bypass the observability spec ("Every request logs trace_id,
+# store_id, endpoint, latency_ms, event_count, status_code"). Without this,
+# 100 connected dashboard clients silently emit zero log lines.
+_api_log = logging.getLogger("api")
 
 
-async def _send_metrics_snapshot(ws: WebSocket, store_id: str) -> None:
+async def _send_metrics_snapshot(ws: WebSocket, store_id: str, trace_id: str) -> None:
+    start = time.perf_counter()
+    status_code = 200
     try:
         snap = await metrics_endpoint(store_id)
         await ws.send_text(json.dumps({"type": "snapshot", "data": snap.model_dump()}))
     except Exception as e:  # noqa: BLE001
+        status_code = 500
         log.warning("ws.snapshot_failed store=%s err=%s", store_id, e)
+    finally:
+        _api_log.info(
+            "request",
+            extra={
+                "trace_id": trace_id,
+                "store_id": store_id,
+                "endpoint": "ws.snapshot",
+                "method": "WS",
+                "latency_ms": int((time.perf_counter() - start) * 1000),
+                "event_count": None,
+                "status_code": status_code,
+            },
+        )
 
 
 @router.websocket("/ws/{store_id}")
@@ -48,7 +71,11 @@ async def ws(
     ),
 ) -> None:
     await ws.accept()
-    await _send_metrics_snapshot(ws, store_id)
+    # One trace_id per WS connection — every snapshot for this connection
+    # shares it so structured-log correlation works across the connection's
+    # lifetime, mirroring the request middleware's per-HTTP-call behaviour.
+    trace_id = uuid.uuid4().hex[:12]
+    await _send_metrics_snapshot(ws, store_id, trace_id)
 
     if not RedisClient.is_ok():
         await ws.send_text(
@@ -63,7 +90,7 @@ async def ws(
         try:
             while True:
                 await asyncio.sleep(5)
-                await _send_metrics_snapshot(ws, store_id)
+                await _send_metrics_snapshot(ws, store_id, trace_id)
         except WebSocketDisconnect:
             return
 
@@ -100,7 +127,7 @@ async def ws(
                 )
             now = datetime.now(timezone.utc)
             if (now - last_snapshot).total_seconds() >= 10:
-                await _send_metrics_snapshot(ws, store_id)
+                await _send_metrics_snapshot(ws, store_id, trace_id)
                 last_snapshot = now
     except WebSocketDisconnect:
         return

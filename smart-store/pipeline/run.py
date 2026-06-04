@@ -611,22 +611,44 @@ def process_billing_camera(
     last_join: dict[str, datetime] = getattr(cs, "_billing_last_join", {})
     last_seen: dict[str, datetime] = getattr(cs, "_billing_last_seen", {})
     last_conf: dict[str, float] = getattr(cs, "_billing_last_conf", {})
+    # Rolling min confidence observed for each visitor *while in the queue
+    # polygon* — emitted on ABANDON and used as a floor for JOIN when no
+    # frame_conf is available (M-6: spec §3.3 says low-conf events must be
+    # FLAGGED, not silently elevated; the prior 0.5 fallback was an invented
+    # value indistinguishable from a real 0.5 detection).
+    min_conf: dict[str, float] = getattr(cs, "_billing_min_conf", {})
     in_queue_set: set[str] = set(in_queue.values())
 
-    # Update last-seen + last-confidence for visitors currently in the queue.
+    # Update last-seen + per-visitor confidence stats for the queue polygon.
     for vid in in_queue_set:
         last_seen[vid] = ts
         if vid in frame_conf:
-            last_conf[vid] = frame_conf[vid]
+            c = frame_conf[vid]
+            last_conf[vid] = c
+            cur_min = min_conf.get(vid)
+            if cur_min is None or c < cur_min:
+                min_conf[vid] = c
 
     # JOIN: visitor present this frame and either never JOINed or last JOIN
     # was longer than the cooldown ago. Confidence reflects the actual
-    # detection in the queue polygon.
+    # detection in the queue polygon — preferring the current frame, falling
+    # back to the rolling min (never an invented value).
     for vid in in_queue_set:
         prior_join = last_join.get(vid)
         if prior_join is None or (ts - prior_join).total_seconds() >= JOIN_COOLDOWN_S:
             sess = state.sessions[vid]
             sess.visited_billing = True
+            join_conf = (
+                frame_conf.get(vid)
+                if vid in frame_conf
+                else min_conf.get(vid, last_conf.get(vid))
+            )
+            # Final fallback only when the visitor was adopted cross-camera
+            # with no per-frame confidence yet (vanishingly rare): use the
+            # detection floor so the event is FLAGGED as low-confidence
+            # rather than synthesised at a midpoint value.
+            if join_conf is None:
+                join_conf = CONFIG.confidence_floor
             emitter.add(build_event(
                 store_id=state.layout.store_id,
                 camera_id=cam_id,
@@ -635,7 +657,7 @@ def process_billing_camera(
                 ts=ts,
                 zone_id="BILLING",
                 is_staff=sess.is_staff,
-                confidence=frame_conf.get(vid, last_conf.get(vid, 0.5)),
+                confidence=join_conf,
                 queue_depth=queue_depth,
                 session_seq=sess.next_seq(),
             ))
@@ -643,9 +665,8 @@ def process_billing_camera(
 
     # ABANDON: visitor was previously seen but hasn't been in the queue for
     # at least ABANDON_GAP_S. Emit once, then drop them from tracking. The
-    # emitted confidence is the last-seen frame's confidence — the visitor
-    # has by definition just left the polygon, so there's no current
-    # detection to consult.
+    # emitted confidence is the rolling min observed during the queue stay —
+    # the conservative reading of "how sure were we this visitor was here".
     abandoned: list[str] = []
     for vid, seen_at in list(last_seen.items()):
         if vid in in_queue_set:
@@ -654,11 +675,17 @@ def process_billing_camera(
             abandoned.append(vid)
     for vid in abandoned:
         sess = state.sessions.get(vid)
-        prior_conf = last_conf.pop(vid, 0.5)
+        observed_min = min_conf.pop(vid, None)
+        last_observed = last_conf.pop(vid, None)
         last_seen.pop(vid, None)
         last_join.pop(vid, None)
         if not sess:
             continue
+        # Prefer the rolling min; fall back to the last observed; only as a
+        # last resort use the detection floor (flagged-low, not invented-mid).
+        abandon_conf = observed_min if observed_min is not None else (
+            last_observed if last_observed is not None else CONFIG.confidence_floor
+        )
         emitter.add(build_event(
             store_id=state.layout.store_id,
             camera_id=cam_id,
@@ -667,7 +694,7 @@ def process_billing_camera(
             ts=ts,
             zone_id="BILLING",
             is_staff=sess.is_staff,
-            confidence=prior_conf,
+            confidence=abandon_conf,
             queue_depth=queue_depth,
             session_seq=sess.next_seq(),
         ))
@@ -675,6 +702,7 @@ def process_billing_camera(
     cs._billing_last_join = last_join   # type: ignore[attr-defined]
     cs._billing_last_seen = last_seen   # type: ignore[attr-defined]
     cs._billing_last_conf = last_conf   # type: ignore[attr-defined]
+    cs._billing_min_conf = min_conf     # type: ignore[attr-defined]
     cs._billing_prev = in_queue_set     # type: ignore[attr-defined]
 
 

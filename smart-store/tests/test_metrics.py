@@ -8,6 +8,9 @@
 #     to fixed ISO timestamps in 2026 to match the supplied data.
 #   - The all-staff test originally asserted unique_visitors == 0 but missed the
 #     conversion_rate==0.0 invariant for that case. Added it.
+#   - Added test_abandonment_rate_pos_corrected (B-2): a JOIN+ABANDON visitor
+#     who has a POS row 30s later must NOT count as abandoned. Spec §3.3 says
+#     ABANDON requires POS correlation — counting raw events overstates churn.
 from __future__ import annotations
 
 import csv
@@ -74,25 +77,24 @@ def test_metrics_zero_purchases(client):
     assert body["conversion_rate"] == 0.0
 
 
+def _insert_pos_sync(order_id: int, ts: str, total: float) -> None:
+    """Synchronous POS insert via sqlite3 (M-7: avoids the new-event-loop
+    bridge that was racing aiosqlite's connection-loop binding)."""
+    import os
+    import sqlite3
+
+    with sqlite3.connect(os.environ["SQLITE_PATH"], timeout=2.0) as con:
+        con.execute(
+            "INSERT INTO pos_transactions (order_id, store_id, ts, total_amount) "
+            "VALUES (?, ?, ?, ?)",
+            (order_id, STORE, ts, total),
+        )
+        con.commit()
+
+
 def test_metrics_with_pos_correlation(client, tmp_path):
     """A visitor in the billing zone within 5 min before a POS tx counts as converted."""
-    # Inject a POS row directly via SQLite
-    from app.db import Database
-
-    async def _insert_pos():
-        async with Database.instance().cursor() as cur:
-            await cur.execute(
-                "INSERT INTO pos_transactions (order_id, store_id, ts, total_amount) VALUES (?, ?, ?, ?)",
-                (999_001, STORE, "2026-03-08T10:08:00Z", 1500.0),
-            )
-
-    import asyncio
-
-    loop = asyncio.new_event_loop()
-    try:
-        loop.run_until_complete(_insert_pos())
-    finally:
-        loop.close()
+    _insert_pos_sync(999_001, "2026-03-08T10:08:00Z", 1500.0)
 
     events = [
         _e(event_id="cc01", visitor_id="VIS_buyer", event_type="ENTRY", timestamp="2026-03-08T10:00:00Z"),
@@ -103,3 +105,38 @@ def test_metrics_with_pos_correlation(client, tmp_path):
     body = client.get(f"/stores/{STORE}/metrics").json()
     assert body["purchasing_visitors"] == 1
     assert body["conversion_rate"] == 1.0
+
+
+def test_abandonment_rate_pos_corrected(client, tmp_path):
+    """B-2: a visitor who emitted JOIN+ABANDON but later paid via POS must NOT
+    count as abandoned. The pipeline emits ABANDON whenever the visitor leaves
+    the queue polygon for >5s — but a brief step-out followed by a real
+    purchase is not a churn event. Spec §3.3 says ABANDON requires POS
+    correlation; we resolve at read time.
+    """
+    # POS tx 30s after VIS_paid's BILLING_QUEUE_ABANDON.
+    _insert_pos_sync(999_002, "2026-03-08T10:08:30Z", 1200.0)
+
+    events = [
+        # Two visitors: one truly abandoned, one a brief step-out who then paid.
+        _e(event_id="ab01", visitor_id="VIS_paid", event_type="ENTRY",
+           timestamp="2026-03-08T10:00:00Z"),
+        _e(event_id="ab02", visitor_id="VIS_paid", event_type="BILLING_QUEUE_JOIN",
+           zone_id="BILLING", metadata={"queue_depth": 2}, timestamp="2026-03-08T10:07:00Z"),
+        _e(event_id="ab03", visitor_id="VIS_paid", event_type="BILLING_QUEUE_ABANDON",
+           zone_id="BILLING", metadata={"queue_depth": 2}, timestamp="2026-03-08T10:08:00Z"),
+        _e(event_id="ab04", visitor_id="VIS_lost", event_type="ENTRY",
+           timestamp="2026-03-08T10:10:00Z"),
+        _e(event_id="ab05", visitor_id="VIS_lost", event_type="BILLING_QUEUE_JOIN",
+           zone_id="BILLING", metadata={"queue_depth": 1}, timestamp="2026-03-08T10:12:00Z"),
+        _e(event_id="ab06", visitor_id="VIS_lost", event_type="BILLING_QUEUE_ABANDON",
+           zone_id="BILLING", metadata={"queue_depth": 1}, timestamp="2026-03-08T10:14:00Z"),
+    ]
+    _post(client, events)
+    body = client.get(f"/stores/{STORE}/metrics").json()
+    # 2 visitors joined; 1 paid (POS-correlated), 1 truly abandoned → rate 0.5
+    assert body["purchasing_visitors"] == 1
+    assert body["abandonment_rate"] == 0.5, (
+        f"expected POS-corrected rate=0.5 (1 of 2 truly abandoned), "
+        f"got {body['abandonment_rate']}"
+    )

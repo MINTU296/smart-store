@@ -31,7 +31,7 @@ from fastapi import APIRouter, HTTPException, Query
 
 from .config import get_settings
 from .db import Database, StorageUnavailable
-from .metrics import _today_window
+from .metrics import _today_window, now_for_store
 from .models import (
     CameraStatus,
     ConversionProxies,
@@ -619,14 +619,18 @@ async def insights(
 
     today_start_iso, today_end_iso = await _today_window(store_id)
     end_dt = _parse(today_end_iso) or _now()
+    # Anchored "now" — the most recent event ts for this store. Used for
+    # camera-stale detection and queue-trend windowing so historical-clip
+    # runs don't falsely report every camera as stale.
+    anchor = await now_for_store(store_id)
     win_start_dt = end_dt - timedelta(hours=window_hours)
     win_start_iso = _iso(win_start_dt)
     win_end_iso = _iso(end_dt)
 
-    cameras = await _cameras(store_id, end_dt)
+    cameras = await _cameras(store_id, anchor)
     occupancy = await _occupancy(store_id, today_start_iso, today_end_iso)
     deltas = await _deltas(store_id, today_start_iso, today_end_iso)
-    queue_trend = await _queue_trend(store_id, end_dt)
+    queue_trend = await _queue_trend(store_id, anchor)
     traffic = await _traffic_by_hour(store_id, win_start_iso, win_end_iso)
     zones, busiest, quietest = await _zone_attention_vs_conversion(store_id, today_start_iso, today_end_iso)
     staff_customers = await _staff_vs_customers(store_id, win_start_iso, win_end_iso)

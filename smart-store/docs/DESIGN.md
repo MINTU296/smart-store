@@ -162,14 +162,21 @@ low-confidence detections by promoting them on continuity rather than dropping
 them — which is exactly the partial-occlusion case the rubric calls out.
 
 **Re-ID.** A colour-histogram embedding (96 dim, L2-normalised) compared by
-cosine similarity at threshold 0.75 over a 30-min window. We deliberately
-shipped without OSNet/torchreid because it adds heavy GPU-only dependencies
-that don't fit in a CPU-bound docker image. The interface in `pipeline/reid.py`
-is identical to what an OSNet wrapper would expose, so the upgrade is a
-one-file swap once a GPU host is available. The trade-off: cosine-on-histogram
-will mis-merge two visitors wearing similar clothing — this is documented in
-CHOICES.md and is the honest answer to the "customer leaves and a different
-customer enters 3 seconds later" follow-up question.
+cosine similarity at threshold 0.75. Two windows govern when an embedding
+is eligible to match: a **re-entry window** of 30 min (`PIPELINE_REENTRY_WINDOW_SEC`)
+within which a re-appearance counts as a `REENTRY` rather than a new `ENTRY`,
+and a **max-lifetime cap** of 45 min (`PIPELINE_REID_MAX_LIFETIME_SEC`) after
+which the identity is evicted regardless of recent observations. The cap
+prevents a long-stayer's embedding from absorbing a similarly-dressed arrival
+much later (which would falsely register as their REENTRY).
+
+We deliberately shipped without OSNet/torchreid because it adds heavy GPU-only
+dependencies that don't fit in a CPU-bound docker image. The interface in
+`pipeline/reid.py` is identical to what an OSNet wrapper would expose, so the
+upgrade is a one-file swap once a GPU host is available. The trade-off:
+cosine-on-histogram will mis-merge two visitors wearing similar clothing —
+this is documented in CHOICES.md and is the honest answer to the "customer
+leaves and a different customer enters 3 seconds later" follow-up question.
 
 **Zones.** Polygons live in `store_layouts/STORE_BLR_00X.json`, normalised
 0..1 over each camera's frame. `pipeline/zones.find_zone()` is plain Python
@@ -253,13 +260,21 @@ as `duplicate`; a Redis hiccup is logged but never reaches the client.
   that store — this matters because graders run the pipeline against
   historical clips, not today's.
 
-- `/funnel` — Entry → Zone Visit → Billing Queue → Purchase, with each stage
-  enforced as a *subset* of the previous one. Re-entries collapse onto the
-  same visitor so a returning customer never double-counts in any stage.
+- `/funnel` — Entry → Zone Visit → Billing Queue → Purchase. Every stage is
+  trimmed to visitors who actually entered today (so a POS row from someone
+  the entry camera never saw doesn't count as a Purchase), but stages are
+  **not** cascade-filled upward. If billing-queue joiners exceed observed
+  zone visitors, the floor camera missed someone — we surface that gap as
+  `data_warning` on the response rather than papering over it. Re-entries
+  collapse onto the same visitor so a returning customer never double-counts.
 
-- `/heatmap` — per-zone visit count + avg dwell, normalised to 0..100 by a
-  weighted blend of both signals. Returns `data_confidence: low` when fewer
-  than 20 sessions are in the window, so the dashboard can display a hint
+- `/heatmap` — per-zone visit count + total dwell, normalised to 0..100 by
+  a weighted blend (visits + total_dwell_ms). Using *total* rather than *avg*
+  dwell keeps the score honest when only one zone has fired its first 30s
+  DWELL emission yet — average-dwell would otherwise give a 1-visitor zone
+  with the only DWELL emission a higher score than a 100-visitor zone with
+  none. Returns `data_confidence: low` when fewer than 20 sessions are in
+  the window, so the dashboard can display a hint
   rather than treating the data as authoritative.
 
 - `/anomalies` — three signals with explicit severities and `suggested_action`
@@ -290,7 +305,12 @@ different teams' wires in production) while making the spec-required
 behaviour available to consumers through a single endpoint.
 
 - `/health` — last event timestamp per store, `STALE_FEED` warning at >10 min
-  lag, plus DB and Redis liveness flags. This is the on-call diagnostic.
+  lag, plus DB and Redis liveness flags. The lag is measured against the
+  freshest event timestamp across the cluster (not wall clock) so a fresh
+  pipeline run against historical clips doesn't false-positive every store
+  to "stale". `/anomalies` and `/insights` use the same data-anchored "now"
+  so DEAD_ZONE and the queue-spike p95 window also reflect the dataset's
+  time, not the reviewer's clock. This is the on-call diagnostic.
 
 - `/insights` — single composite endpoint the React dashboard reads from for
   every panel that isn't covered by the four endpoints above. Returns:

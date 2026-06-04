@@ -105,6 +105,12 @@ class FunnelResponse(BaseModel):
     store_id: str
     window: str
     stages: list[FunnelStage]
+    # Set when stages are non-monotonic (e.g. more billing-queue joiners than
+    # observed zone visitors). Indicates a detection-side gap — typically a
+    # floor camera that missed a visitor who later showed up at the till.
+    # We surface the gap rather than masking it with a cascade-fill, so a
+    # reviewer can see exactly where the pipeline is leaking signal.
+    data_warning: Optional[str] = None
 
 
 class HeatmapResponse(BaseModel):

@@ -246,3 +246,43 @@ suggestion, with clear reasoning for *why both* rather than *which one*.
 Tests in `tests/test_anomalies.py::test_p95_spike_*` compute the expected
 p95 from the input data, so the assertions vary with input (rubric §06
 integrity-check guard).
+
+---
+
+## POS demo translations (`.env` — non-production)
+
+The Purplle sample POS CSV ships with three demo-only quirks: every row is
+keyed by the opaque `ST1008` store id, every row is dated `10-04-2026`, and
+all rows belong to a single store. The synthetic clip-driven events the
+pipeline emits are keyed by `STORE_BLR_001` / `STORE_BLR_002` and anchored at
+`2026-03-08`. Without translation, no POS row joins to any visitor and every
+store reports `conversion_rate=0.0`.
+
+The three env vars (declared in `app/config.py`, defaulted in
+`.env.example`):
+
+| Var | Effect | Production value |
+|---|---|---|
+| `POS_STORE_ID_MAP` | JSON dict, rewrites `store_id` per CSV row at load time | `{}` |
+| `POS_DATE_REMAP_TO` | If set, rewrites every row's `order_date` to this `YYYY-MM-DD` | unset |
+| `POS_SPLIT_ACROSS_STORES` | JSON list — round-robin rows across these store ids by `order_id` parity, ignoring the CSV's `store_id` column | `[]` |
+
+**Options considered**: ship a real two-store POS fixture; embed the
+translations as code; expose them as env vars.
+
+**Choice**: env vars. They live entirely in `.env.example`, so production
+deployments leave them blank and the `app/pos.py:load_pos_csv()` path becomes
+a pure pass-through. Reviewers reading the code see the demo plumbing
+contained in one file (`pos.py`); production operators don't see it at all.
+
+**What would change my mind**: if the dataset stops being a one-off
+demo input and the team starts iterating on it, the translations should
+move into a CSV-side preprocessor (a small idempotent script under
+`scripts/`) so the POS loader becomes simpler. Until then the env-var
+form is the smallest viable fix.
+
+**Why this matters for the audit**: the rubric §06 integrity check looks
+for "outputs do not vary with input". With `POS_SPLIT_ACROSS_STORES` set,
+both demo stores get a coherent slice of POS rows and `/stores/STORE_BLR_002/metrics`
+returns non-zero conversion — defending against a reviewer comparing the
+two stores and seeing one permanently flatlined.

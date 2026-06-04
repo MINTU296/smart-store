@@ -57,8 +57,11 @@ pnpm-debug.log*
 .yarn/
 .parcel-cache/
 
-# Built dashboard output (regenerated from dashboard-src)
-dashboard/assets/
+# Vite build output for the dashboard. The committed bundle in
+# dashboard/assets/ is the production artifact that ships with the API
+# image (the API serves it as static files; there is no Node toolchain
+# in the container). Rebuild it locally with
+# `cd dashboard-src && npm run build` and commit the new hashed filenames.
 dashboard-src/dist/
 
 # TypeScript build artifacts

@@ -48,11 +48,17 @@ async def health() -> HealthResponse:
         rows = await db.execute(
             "SELECT store_id, MAX(ts) AS last_ts FROM events GROUP BY store_id"
         )
-        now = datetime.now(timezone.utc)
+        # STALE_FEED compares each store's last_ts against the freshest store's
+        # last_ts (the system's "data now"), not wall-clock now. Reviewers run
+        # the pipeline against historical clips, so wall-clock comparison falsely
+        # marks every store as stale. Wall clock is only used when the entire
+        # cluster has no data at all.
+        parsed = [(r, _parse(r["last_ts"])) for r in rows]
+        valid = [dt for _, dt in parsed if dt is not None]
+        anchor = max(valid) if valid else datetime.now(timezone.utc)
         cutoff = timedelta(minutes=settings.stale_feed_minutes)
-        for r in rows:
-            last = _parse(r["last_ts"])
-            stale = bool(last and (now - last) > cutoff)
+        for r, last in parsed:
+            stale = bool(last and (anchor - last) > cutoff)
             stores.append(StoreHealth(store_id=r["store_id"], last_event_ts=r["last_ts"], stale=stale))
             if stale:
                 warnings.append(f"STALE_FEED store_id={r['store_id']} last={r['last_ts']}")

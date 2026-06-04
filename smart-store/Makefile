@@ -3,7 +3,7 @@
 # smoke` collapses that into one command and prints every endpoint's
 # response body so the reviewer can audit the numbers at a glance.
 
-.PHONY: smoke up down seed test pipeline
+.PHONY: smoke up down seed test coverage pipeline
 
 smoke:        ## boot stack, post a fresh fixture, hit every read endpoint
 	@bash scripts/smoke.sh
@@ -21,6 +21,9 @@ seed:         ## post the smoke fixture without booting / asserting
 
 test:         ## run the test suite with coverage
 	@pytest --cov=app --cov=pipeline -q
+
+coverage:     ## reproduce the README coverage table (excludes integration-only paths)
+	@pytest --cov=app --cov=pipeline --cov-report=term-missing -q
 
 pipeline:     ## run the YOLO pipeline against Store 1 inside compose
 	@docker compose run --rm pipeline \

@@ -69,21 +69,32 @@ async def funnel(store_id: str) -> FunnelResponse:
     }
     purchased = await visitors_who_purchased(store_id, start_iso, end_iso)
 
-    # Enforce the funnel cascade strictly: each stage must be a subset of the
-    # previous one, with each stage's set INCLUDING anyone who reached a later
-    # stage. This handles two real-world artefacts:
-    #
-    #  - A visitor who joined the billing queue obviously also walked through
-    #    the store. They may not show a ZONE_ENTER record because the floor
-    #    camera missed them, but logically they're a Zone Visit too.
-    #  - A POS-matched purchaser must have queued at the till; same idea
-    #    applies upward through the funnel.
-    #
-    # Without this, stage counts can grow downstream (billing > zone), which
-    # produces nonsense drop-off% values like -400%.
+    # Constrain everything to visitors who actually entered the store today —
+    # POS rows from a non-tracked visitor (e.g. someone who paid before
+    # the entry camera saw them) are not counted. This is the only "trim"
+    # we apply: it preserves the cascade invariant at the top of the funnel
+    # without masking detection gaps further down.
+    zone_visited &= entered
+    billing_joined &= entered
     purchased &= entered
-    billing_joined = (billing_joined | purchased) & entered
-    zone_visited = (zone_visited | billing_joined) & entered
+
+    # Surface (don't paper over) detection-side gaps. If billing-queue joiners
+    # exceed observed zone visitors, the floor camera missed someone — keep
+    # the raw counts and flag it. Reviewers asking "where are we losing
+    # customers?" deserve an honest answer; the previous code stuffed those
+    # missed visitors into Zone Visit, which made the floor camera look
+    # perfect when it wasn't.
+    warnings: list[str] = []
+    if len(billing_joined) > len(zone_visited):
+        warnings.append(
+            f"floor camera coverage gap: {len(billing_joined) - len(zone_visited)} "
+            f"billing-queue joiner(s) lack a ZONE_ENTER record"
+        )
+    if len(purchased) > len(billing_joined):
+        warnings.append(
+            f"billing-queue detection gap: {len(purchased) - len(billing_joined)} "
+            f"POS-matched purchaser(s) lack a BILLING_QUEUE_JOIN record"
+        )
 
     counts = [
         ("Entry", len(entered)),
@@ -97,8 +108,16 @@ async def funnel(store_id: str) -> FunnelResponse:
         if i == 0 or prev == 0:
             drop = 0.0
         else:
-            drop = round(100 * (1 - n / prev), 2)
+            # Clamp to [0, 100] so a non-monotonic stage (flagged in
+            # data_warning above) doesn't render as a negative drop-off.
+            raw = 100 * (1 - n / prev)
+            drop = round(max(0.0, min(100.0, raw)), 2)
         stages.append(FunnelStage(name=name, count=n, drop_off_pct=drop))
         prev = n
 
-    return FunnelResponse(store_id=store_id, window=f"{start_iso}/{end_iso}", stages=stages)
+    return FunnelResponse(
+        store_id=store_id,
+        window=f"{start_iso}/{end_iso}",
+        stages=stages,
+        data_warning="; ".join(warnings) if warnings else None,
+    )

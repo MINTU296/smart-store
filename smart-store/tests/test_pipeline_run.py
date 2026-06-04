@@ -127,6 +127,52 @@ def test_billing_camera_emits_join_then_abandon():
     assert join["metadata"]["queue_depth"] == 1
 
 
+def test_billing_abandon_uses_rolling_min_confidence():
+    """M-6: ABANDON's emitted confidence reflects the WORST observation made
+    during the queue stay, not a hardcoded 0.5 marker. Spec §3.3 says
+    low-conf events must be FLAGGED, not silently elevated; the prior fallback
+    invented a midpoint value indistinguishable from a real 0.5 detection.
+    """
+    layout = StoreLayout(
+        store_id="S",
+        cameras={
+            "BILL": CameraLayout(
+                name="BILL", role="billing",
+                queue_polygon=[(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)],
+            )
+        },
+        clip_camera_map={},
+    )
+    state = PipelineState(layout=layout)
+    cam = layout.cameras["BILL"]
+    captured: list[dict] = []
+
+    class _Sink:
+        def add(self, e):
+            captured.append(e)
+
+    sink = _Sink()
+    # Visitor in queue at three timestamps with confidences 0.9, 0.42, 0.71.
+    # Rolling min = 0.42, which should appear on the ABANDON event.
+    t0 = datetime(2026, 3, 8, 18, 0, 0, tzinfo=timezone.utc)
+    t1 = datetime(2026, 3, 8, 18, 0, 1, tzinfo=timezone.utc)
+    t2 = datetime(2026, 3, 8, 18, 0, 2, tzinfo=timezone.utc)
+    t3 = datetime(2026, 3, 8, 18, 0, 8, tzinfo=timezone.utc)  # >5s gap → ABANDON
+
+    process_billing_camera(state, "BILL", cam,
+                           {1: Detection(0.4, 0.4, 0.6, 0.6, 0.90)}, t0, sink)
+    process_billing_camera(state, "BILL", cam,
+                           {1: Detection(0.4, 0.4, 0.6, 0.6, 0.42)}, t1, sink)
+    process_billing_camera(state, "BILL", cam,
+                           {1: Detection(0.4, 0.4, 0.6, 0.6, 0.71)}, t2, sink)
+    process_billing_camera(state, "BILL", cam, {}, t3, sink)
+
+    abandon = next(e for e in captured if e["event_type"] == "BILLING_QUEUE_ABANDON")
+    assert abandon["confidence"] == 0.42, (
+        f"expected rolling min 0.42 (worst observation), got {abandon['confidence']}"
+    )
+
+
 def test_floor_camera_emits_zone_enter_and_dwell():
     """A track that stays in a zone long enough produces ZONE_ENTER + ZONE_DWELL."""
     layout = StoreLayout(

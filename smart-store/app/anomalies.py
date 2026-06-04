@@ -39,7 +39,7 @@ from fastapi import APIRouter, HTTPException
 
 from .config import get_settings
 from .db import Database, RedisClient, StorageUnavailable
-from .metrics import _today_window
+from .metrics import _today_window, now_for_store
 from .models import Anomaly, AnomaliesResponse
 from .pos import visitors_who_purchased
 
@@ -66,18 +66,27 @@ async def anomalies(store_id: str) -> AnomaliesResponse:
     settings = get_settings()
     found: list[Anomaly] = []
     start_iso, end_iso = await _today_window(store_id)
+    # Anchored "now" — derived from the most recent event ts for this store.
+    # Using datetime.now(utc) here floods DEAD_ZONE / starves the p95 window
+    # whenever reviewers run against historical clips.
+    anchor = await now_for_store(store_id)
 
     # ---- Queue spike --------------------------------------------------------
+    # Time-bound the SQL fallback to the last 15 minutes so a JOIN from days
+    # ago can't drive a false-positive BILLING_QUEUE_SPIKE today.
     q_depth = await RedisClient.get_queue_depth(store_id)
     if q_depth == 0:
+        cutoff_iso = (
+            (anchor - timedelta(minutes=15)).isoformat().replace("+00:00", "Z")
+        )
         rows = await db.execute(
             """
             SELECT json_extract(metadata,'$.queue_depth') AS q
             FROM events
-            WHERE store_id = ? AND event_type = 'BILLING_QUEUE_JOIN'
+            WHERE store_id = ? AND event_type = 'BILLING_QUEUE_JOIN' AND ts >= ?
             ORDER BY ts DESC LIMIT 1
             """,
-            (store_id,),
+            (store_id, cutoff_iso),
         )
         if rows and rows[0]["q"] is not None:
             try:
@@ -104,10 +113,7 @@ async def anomalies(store_id: str) -> AnomaliesResponse:
     # branch catches drift the operator never set a threshold for. The two
     # codes are distinct so the dashboard can colour them differently.
     p95_window_iso = (
-        (
-            datetime.now(timezone.utc)
-            - timedelta(minutes=settings.queue_spike_p95_window_min)
-        )
+        (anchor - timedelta(minutes=settings.queue_spike_p95_window_min))
         .isoformat()
         .replace("+00:00", "Z")
     )
@@ -208,7 +214,7 @@ async def anomalies(store_id: str) -> AnomaliesResponse:
     # ---- Dead zone ----------------------------------------------------------
     if today_n > 0:
         cutoff_iso = (
-            (datetime.now(timezone.utc) - timedelta(minutes=settings.dead_zone_minutes))
+            (anchor - timedelta(minutes=settings.dead_zone_minutes))
             .isoformat()
             .replace("+00:00", "Z")
         )

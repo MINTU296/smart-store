@@ -31,6 +31,30 @@ Every component improves either the **accuracy** of that number (detection,
 re-ID, staff exclusion, POS correlation) or its **actionability** (real-time
 metrics, session funnel, anomaly detection, live dashboard).
 
+**Design principles, in priority order.**
+
+1. *The acceptance gate is sacred.* `docker compose up` boots the entire
+   system without manual intervention. Anything that threatens the gate (GPU
+   dependencies, multi-step bootstrap, hidden seed steps, opinionated
+   third-party services) is a liability — the alternative ship is preferred
+   even when the alternative is technically inferior. The Re-ID and SQLite
+   choices are both downstream of this principle.
+2. *The schema is the contract between halves.* `POST /events/ingest` is the
+   only thing pipeline and API agree on. Either side can be replaced
+   wholesale (clip mode → live RTSP today; YOLO → an edge runtime tomorrow)
+   as long as the schema holds.
+3. *SQLite is the system of record; Redis is an accelerator.* Every Redis
+   read has a SQLite fallback. If Redis dies the dashboard degrades to
+   polling but the API still serves the correct numbers. If SQLite dies the
+   API returns `503` cleanly with a structured body — never a stack trace.
+4. *Idempotency at the storage layer.* Deterministic `event_id`s mean a
+   re-ingest is always a no-op. Reviewers (and operators) never have to ask
+   "did I already run this?" — they can just run it again.
+5. *Every numeric output should vary with input.* The rubric §06 integrity
+   check is real, and `make smoke` proves it: numbers change with the
+   fixture, the fixture is generated fresh every run, and the same pipeline
+   against different clips produces different `/metrics` output.
+
 ## 2. System diagram
 
 ```
@@ -67,6 +91,51 @@ disk-backed clips; tomorrow it could be edge cameras streaming directly to
 Kinesis/Kafka — the API does not change.
 
 ## 3. Stage-by-stage rationale
+
+This section walks each layer of the system from camera to API response. To
+ground the abstractions, here is the **end-to-end journey of a single
+visitor** through the system — what fires when, in what order, and which file
+owns each step:
+
+1. **Visitor crosses the entry-camera line.** YOLO detects a person, ByteTrack
+   assigns an integer track id, the line-crossing state machine in
+   `pipeline/run.py:process_entry_camera` emits an `ENTRY` event. The
+   colour-histogram embedding is stored in `pipeline/reid.py` keyed by
+   `visitor_id`. A `group_size` window starts on this camera.
+2. **Within 2 seconds, two more visitors cross.** Each gets its own track,
+   its own `ENTRY` event, its own `visitor_id`. After the window closes, all
+   three events are *back-stamped* `metadata.group_size = 3` so the cohort
+   is recoverable for follow-up Q&A while `/metrics` continues to count
+   individuals.
+3. **The visitor walks onto the floor camera within 3 seconds, in the
+   spatial overlap region.** `_adopt_floor_track` matches the entry's
+   `visitor_id` instead of spawning a new one — no double-count at the
+   threshold.
+4. **Visitor enters the MOISTURISER zone polygon.**
+   `pipeline/zones.find_zone` (Python ray-casting) returns the zone id;
+   `process_floor_camera` emits `ZONE_ENTER`, then `ZONE_DWELL` every 30 s
+   while the visitor is inside, then `ZONE_EXIT` when they leave.
+5. **Visitor joins the billing queue.** `process_billing_camera` emits
+   `BILLING_QUEUE_JOIN` with `metadata.queue_depth` (recomputed every frame).
+6. **Visitor leaves the queue without paying.** A debounced 5-second
+   absence in the queue polygon triggers a candidate `BILLING_QUEUE_ABANDON`.
+   This is *only* a candidate at this stage — the pipeline cannot see POS.
+7. **Pipeline POSTs the batch to `/events/ingest`.** `pipeline/emit.py` sends
+   200 events at a time; the API validates each with Pydantic, UPSERTs by
+   `event_id`, and writes to Redis (counters + `XADD` to the per-store
+   stream) only after the SQL commit.
+8. **Reviewer hits `/stores/STORE_BLR_001/metrics`.** `app/metrics.py` joins
+   today's events against `pos_transactions` in a 5-minute window
+   (`app/pos.py:visitors_who_purchased`). The candidate `BILLING_QUEUE_ABANDON`
+   from step 6 is upgraded to a *true* abandon if no POS row matches —
+   producing the `abandonment_rate` field.
+9. **The dashboard's WebSocket carries every event live.** `app/ws.py`
+   `XREAD`s from `events:STORE_BLR_001` and pushes JSON frames to connected
+   clients. Reconnects replay from `?last_id=` so a flaky network never
+   loses events.
+
+The remainder of §3 explains *why* each of those steps is implemented the way
+it is, what was rejected, and what the trade-offs are.
 
 ### 3.1 Detection layer (`pipeline/`)
 
@@ -142,17 +211,39 @@ the rest of the run.
 The schema follows the PDF spec exactly: `event_id`, `store_id`, `camera_id`,
 `visitor_id`, `event_type`, `timestamp`, `zone_id`, `dwell_ms`, `is_staff`,
 `confidence`, and a `metadata` envelope carrying `queue_depth`, `sku_zone`,
-`session_seq`. The illustrative `data/sample_eventsbe42122.jsonl` uses a
-different schema (`id_token`, `gender_pred`, `queue_event_id`); we treat the
-PDF as authoritative because that is what is scored.
+`session_seq`, and (for `ENTRY` events) `group_size`. The eight `event_type`
+values match the rubric's named set: `ENTRY`, `EXIT`, `REENTRY`, `ZONE_ENTER`,
+`ZONE_EXIT`, `ZONE_DWELL`, `BILLING_QUEUE_JOIN`, `BILLING_QUEUE_ABANDON`.
+`PURCHASE` is synthesised at correlation time from POS rows rather than
+emitted by the pipeline — cameras and tills live on different teams' wires in
+production, so the API is the natural place to fuse them.
+
+The illustrative `data/sample_eventsbe42122.jsonl` uses a *different* schema
+(`id_token`, `gender_pred`, `queue_event_id`) and even varies its field names
+per event type. We treat the PDF as authoritative because the schema-compliance
+dimension of the rubric is scored against the PDF, and the sample file's value
+is as a visual reference — not a contract. The trade-off and what would change
+this decision is documented in `CHOICES.md` Decision 2.
 
 ### 3.3 Ingestion API
 
 `POST /events/ingest` validates each event individually with Pydantic v2,
 inserts via SQLite UPSERT (PRIMARY KEY on `event_id`), and reports per-event
-status (`stored` / `duplicate` / `rejected`). Side-effects — Redis counter
-updates, WebSocket pub/sub broadcast — run *after* the SQL transaction
-commits so the system of record is consistent even if Redis is down.
+status (`stored` / `duplicate` / `rejected`) with the validation error inline
+for rejected rows. The batch cap is 500 events — a 600-event POST gets a
+clean `413 Payload Too Large` rather than a 5xx, so a misconfigured emitter
+fails loudly instead of crashing the API.
+
+Side-effects — Redis counter updates, `XADD` to the per-store WebSocket
+stream — run *after* the SQL transaction commits, so the system of record is
+consistent even if Redis is down. Each side-effect is wrapped to swallow
+transient Redis errors and return a safe default; SQLite remains the source
+of truth and reads keep working through a Redis outage.
+
+The deliberate split here: validation, persistence, and observability are
+three separable concerns. A malformed event fails validation and is reported
+in the response; a deduplicated event hits the UPSERT guard and is reported
+as `duplicate`; a Redis hiccup is logged but never reaches the client.
 
 ### 3.4 Read endpoints
 

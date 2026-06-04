@@ -1,0 +1,31 @@
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY pyproject.toml ./
+RUN pip install \
+        "fastapi>=0.110" \
+        "uvicorn[standard]>=0.27" \
+        "pydantic>=2.6" \
+        "pydantic-settings>=2.2" \
+        "redis>=5.0" \
+        "aiosqlite>=0.20" \
+        "httpx>=0.27" \
+        "structlog>=24.1"
+
+COPY app/ ./app/
+COPY dashboard/ ./dashboard/
+COPY store_layouts/ ./store_layouts/
+
+RUN mkdir -p /data
+EXPOSE 8000
+
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]

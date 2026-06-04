@@ -1,0 +1,34 @@
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ffmpeg libgl1 libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip install \
+        "ultralytics>=8.1" \
+        "lap>=0.5.12" \
+        "opencv-python-headless>=4.9" \
+        "numpy>=1.26" \
+        "shapely>=2.0" \
+        "scipy>=1.12" \
+        "httpx>=0.27" \
+        "pydantic>=2.6" \
+        "structlog>=24.1"
+
+# Pre-download YOLOv11n weights so the container doesn't need network on first run.
+RUN python -c "from ultralytics import YOLO; YOLO('yolo11n.pt')"
+
+COPY pipeline/ ./pipeline/
+COPY app/models.py ./app/models.py
+COPY app/__init__.py ./app/__init__.py
+COPY store_layouts/ ./store_layouts/
+
+ENV PYTHONPATH=/app
+
+ENTRYPOINT ["python", "-m", "pipeline.run"]
+CMD ["--store", "STORE_BLR_001", "--clip-dir", "/raw-data/Store 1"]

@@ -1,0 +1,57 @@
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: storeint-redis
+    restart: unless-stopped
+    # Internal-only: avoids host-port conflicts when another Redis is running.
+    expose:
+      - "6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    container_name: storeint-api
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      SQLITE_PATH: /data/store_intelligence.db
+      REDIS_URL: redis://redis:6379/0
+    ports:
+      - "8000:8000"
+    volumes:
+      - api-data:/data
+      - ./store_layouts:/app/store_layouts:ro
+      - ./data:/raw-data:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys;sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status==200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  pipeline:
+    build:
+      context: .
+      dockerfile: Dockerfile.pipeline
+    container_name: storeint-pipeline
+    env_file: .env
+    environment:
+      PIPELINE_API_BASE: http://api:8000
+    volumes:
+      - ./data:/raw-data:ro
+      - ./store_layouts:/app/store_layouts:ro
+    depends_on:
+      api:
+        condition: service_healthy
+    profiles: ["pipeline"]
+
+volumes:
+  api-data:

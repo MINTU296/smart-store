@@ -1,0 +1,56 @@
+{
+  "store_id": "STORE_BLR_002",
+  "store_name": "Apex Retail — Bengaluru 002",
+  "notes": "Store 2 floor plan has wall units 1..14 around the perimeter, two centre makeup units, a cash counter at the back, and a single entry door at the bottom-centre. Two entry cameras (entry 1 / entry 2) cover left/right halves of the doorway respectively, with a small spatial overlap that triggers cross-camera dedup at the entry-line crossing. Polygons here are normalised (0..1) over each camera's frame.",
+  "cameras": {
+    "CAM_ENTRY_1": {
+      "role": "entry",
+      "entry_line": {
+        "y_threshold": 0.65,
+        "inbound_direction": "up",
+        "x_range": [0.0, 0.55]
+      },
+      "overlap_with": ["CAM_ENTRY_2", "CAM_ZONE"],
+      "zones": []
+    },
+    "CAM_ENTRY_2": {
+      "role": "entry",
+      "entry_line": {
+        "y_threshold": 0.65,
+        "inbound_direction": "up",
+        "x_range": [0.45, 1.0]
+      },
+      "overlap_with": ["CAM_ENTRY_1", "CAM_ZONE"],
+      "zones": []
+    },
+    "CAM_ZONE": {
+      "role": "floor",
+      "zones": [
+        {"zone_id": "WALL_UNIT_LEFT_1",  "polygon": [[0.00, 0.10], [0.12, 0.10], [0.12, 0.32], [0.00, 0.32]]},
+        {"zone_id": "WALL_UNIT_LEFT_2",  "polygon": [[0.00, 0.32], [0.12, 0.32], [0.12, 0.55], [0.00, 0.55]]},
+        {"zone_id": "WALL_UNIT_LEFT_3",  "polygon": [[0.00, 0.55], [0.12, 0.55], [0.12, 0.80], [0.00, 0.80]]},
+        {"zone_id": "WALL_UNIT_RIGHT_1", "polygon": [[0.88, 0.10], [1.00, 0.10], [1.00, 0.32], [0.88, 0.32]]},
+        {"zone_id": "WALL_UNIT_RIGHT_2", "polygon": [[0.88, 0.32], [1.00, 0.32], [1.00, 0.55], [0.88, 0.55]]},
+        {"zone_id": "WALL_UNIT_RIGHT_3", "polygon": [[0.88, 0.55], [1.00, 0.55], [1.00, 0.80], [0.88, 0.80]]},
+        {"zone_id": "MAKEUP_UNIT_FRONT", "polygon": [[0.40, 0.42], [0.62, 0.42], [0.62, 0.58], [0.40, 0.58]]},
+        {"zone_id": "MAKEUP_UNIT_REAR",  "polygon": [[0.40, 0.18], [0.62, 0.18], [0.62, 0.34], [0.40, 0.34]]},
+        {"zone_id": "WALL_UNIT_TOP",     "polygon": [[0.18, 0.05], [0.82, 0.05], [0.82, 0.15], [0.18, 0.15]]},
+        {"zone_id": "LEFT_AISLE",        "polygon": [[0.13, 0.05], [0.39, 0.05], [0.39, 0.95], [0.13, 0.95]]},
+        {"zone_id": "RIGHT_AISLE",       "polygon": [[0.63, 0.05], [0.87, 0.05], [0.87, 0.95], [0.63, 0.95]]}
+      ]
+    },
+    "CAM_BILLING": {
+      "role": "billing",
+      "zones": [
+        {"zone_id": "BILLING", "polygon": [[0.15, 0.20], [0.85, 0.20], [0.85, 0.95], [0.15, 0.95]]}
+      ],
+      "queue_polygon": [[0.15, 0.45], [0.85, 0.45], [0.85, 0.95], [0.15, 0.95]]
+    }
+  },
+  "clip_camera_map": {
+    "entry 1.mp4":     "CAM_ENTRY_1",
+    "entry 2.mp4":     "CAM_ENTRY_2",
+    "zone.mp4":        "CAM_ZONE",
+    "billing_area.mp4":"CAM_BILLING"
+  }
+}

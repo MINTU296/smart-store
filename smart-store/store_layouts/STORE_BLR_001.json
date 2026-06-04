@@ -1,0 +1,53 @@
+{
+  "store_id": "STORE_BLR_001",
+  "store_name": "Apex Retail — Bengaluru 001",
+  "notes": "Polygons defined per camera in normalised (0..1) pixel coords. Generated with VLM assistance from data/Store 1/Store 1 - layout.png and refined manually. Zones are derived from the labelled top-down floor plan; per-camera mapping is approximate and tuned for the supplied sample clips. Entry camera (CAM_ENTRY) uses a virtual line at y=0.55 to separate inbound (downward, positive y-velocity) vs outbound motion. Floor cameras (CAM_ZONE_*) carry product-shelf polygons. Billing camera (CAM_BILLING) carries the cash-counter polygon used for queue tracking.",
+  "cameras": {
+    "CAM_ENTRY": {
+      "role": "entry",
+      "entry_line": {
+        "y_threshold": 0.55,
+        "inbound_direction": "down",
+        "x_range": [0.10, 0.90]
+      },
+      "overlap_with": ["CAM_ZONE_1"],
+      "zones": []
+    },
+    "CAM_ZONE_1": {
+      "role": "floor",
+      "zones": [
+        {"zone_id": "SALM",       "polygon": [[0.02, 0.05], [0.18, 0.05], [0.18, 0.20], [0.02, 0.20]]},
+        {"zone_id": "TFS",        "polygon": [[0.18, 0.05], [0.32, 0.05], [0.32, 0.20], [0.18, 0.20]]},
+        {"zone_id": "MINIMALIS",  "polygon": [[0.40, 0.05], [0.52, 0.05], [0.52, 0.20], [0.40, 0.20]]},
+        {"zone_id": "AQUALOGI",   "polygon": [[0.52, 0.05], [0.66, 0.05], [0.66, 0.20], [0.52, 0.20]]},
+        {"zone_id": "FOXTAL",     "polygon": [[0.66, 0.05], [0.80, 0.05], [0.80, 0.20], [0.66, 0.20]]},
+        {"zone_id": "JC",         "polygon": [[0.80, 0.05], [0.96, 0.05], [0.96, 0.20], [0.80, 0.20]]},
+        {"zone_id": "MAKEUP_UNIT","polygon": [[0.40, 0.40], [0.62, 0.40], [0.62, 0.65], [0.40, 0.65]]}
+      ]
+    },
+    "CAM_ZONE_2": {
+      "role": "floor",
+      "zones": [
+        {"zone_id": "FAC",        "polygon": [[0.10, 0.78], [0.28, 0.78], [0.28, 0.95], [0.10, 0.95]]},
+        {"zone_id": "FRAGRANCE",  "polygon": [[0.30, 0.78], [0.42, 0.78], [0.42, 0.95], [0.30, 0.95]]},
+        {"zone_id": "NAIL_UNIT",  "polygon": [[0.42, 0.78], [0.50, 0.78], [0.50, 0.95], [0.42, 0.95]]},
+        {"zone_id": "MENS",       "polygon": [[0.50, 0.78], [0.62, 0.78], [0.62, 0.95], [0.50, 0.95]]},
+        {"zone_id": "LOREAL",     "polygon": [[0.66, 0.78], [0.84, 0.78], [0.84, 0.95], [0.66, 0.95]]},
+        {"zone_id": "BEAUT",      "polygon": [[0.84, 0.78], [0.96, 0.78], [0.96, 0.95], [0.84, 0.95]]}
+      ]
+    },
+    "CAM_BILLING": {
+      "role": "billing",
+      "zones": [
+        {"zone_id": "BILLING", "polygon": [[0.20, 0.10], [0.85, 0.10], [0.85, 0.95], [0.20, 0.95]]}
+      ],
+      "queue_polygon": [[0.20, 0.40], [0.85, 0.40], [0.85, 0.95], [0.20, 0.95]]
+    }
+  },
+  "clip_camera_map": {
+    "CAM 3 - entry.mp4":  "CAM_ENTRY",
+    "CAM 1 - zone.mp4":   "CAM_ZONE_1",
+    "CAM 2 - zone.mp4":   "CAM_ZONE_2",
+    "CAM 5 - billing.mp4":"CAM_BILLING"
+  }
+}

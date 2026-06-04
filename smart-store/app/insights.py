@@ -589,6 +589,11 @@ async def _conversion_proxies(
             (store_id, start_iso, end_iso),
         )
     } & entered
+    # Cascade: a billing-queue visitor walked through the store, so they
+    # should always count toward zone_visited even if the floor cam missed
+    # their ZONE_ENTER. Mirrors the /funnel cascade and prevents
+    # engagement_rate < checkout_engagement.
+    zone_visited = (zone_visited | billing_joined) & entered
     n = max(1, len(entered))
     return ConversionProxies(
         entered=len(entered),

@@ -169,8 +169,8 @@ def test_floor_camera_emits_zone_enter_and_dwell():
 
 def test_group_entry_marks_group_size():
     """3 detections crossing the entry line within 1 second → all 3 ENTRY events
-    end up tagged with metadata.group_size == 3 (back-stamping is what makes
-    the earlier-emitted events match the final group count)."""
+    are held in the pending-group queue until the 2s window closes, then
+    released atomically with metadata.group_size == 3 on every event."""
     layout = StoreLayout(
         store_id="S",
         cameras={
@@ -221,10 +221,83 @@ def test_group_entry_marks_group_size():
         12: Detection(0.80, 0.55, 0.90, 0.65, 0.92),
     }, t3, {}, sink)
 
+    # Advance past the 2-second group window so the held batch flushes.
+    t_flush = datetime(2026, 3, 8, 18, 0, 3, tzinfo=timezone.utc)
+    process_entry_camera(state, "ENT", cam, {}, t_flush, {}, sink)
+
     entries = [e for e in captured if e["event_type"] == "ENTRY"]
     assert len(entries) == 3, f"expected 3 ENTRY events, got {len(entries)}: {entries}"
     sizes = [e["metadata"]["group_size"] for e in entries]
-    assert sizes == [3, 3, 3], f"group_size should be back-stamped to 3 on all entries; got {sizes}"
+    assert sizes == [3, 3, 3], f"group_size should be 3 on all entries after atomic flush; got {sizes}"
+
+
+def test_group_atomic_flush_survives_intermediate_emitter_flush():
+    """Regression: previously, ENTRY events were emitted immediately with a
+    provisional group_size and back-stamped in-place inside the emitter
+    buffer. If the emitter's batch flush ran between two arrivals in the
+    same 2-second window, earlier events shipped with `group_size=N` while
+    later events shipped with `group_size=N+1` — a race that would never be
+    reconciled. The new contract holds events in `cs.pending_group` until
+    the window closes, so this test exercises a sink that flushes after
+    *every* event and still asserts a consistent final group_size."""
+    layout = StoreLayout(
+        store_id="S",
+        cameras={
+            "ENT": CameraLayout(
+                name="ENT",
+                role="entry",
+                entry_line={"y_threshold": 0.5, "inbound_direction": "down", "x_range": [0.0, 1.0]},
+            )
+        },
+        clip_camera_map={},
+    )
+    state = PipelineState(layout=layout)
+    cam = layout.cameras["ENT"]
+
+    flushed: list[dict] = []  # what the API would actually see, in order
+
+    class _AggressiveSink:
+        """Mirrors the worst case: every add() triggers a flush."""
+        def add(self, e):
+            flushed.append(e)
+
+    sink = _AggressiveSink()
+    t0 = datetime(2026, 3, 8, 18, 0, 0, tzinfo=timezone.utc)
+    # Prime three tracks above the line.
+    process_entry_camera(state, "ENT", cam, {
+        20: Detection(0.20, 0.30, 0.30, 0.45, 0.90),
+        21: Detection(0.50, 0.30, 0.60, 0.45, 0.90),
+        22: Detection(0.80, 0.30, 0.90, 0.45, 0.90),
+    }, t0, {}, sink)
+
+    # Each crosses on a separate frame, ~300 ms apart.
+    t1 = datetime(2026, 3, 8, 18, 0, 0, 300_000, tzinfo=timezone.utc)
+    process_entry_camera(state, "ENT", cam, {
+        20: Detection(0.20, 0.55, 0.30, 0.65, 0.91),
+        21: Detection(0.50, 0.30, 0.60, 0.45, 0.91),
+        22: Detection(0.80, 0.30, 0.90, 0.45, 0.91),
+    }, t1, {}, sink)
+    t2 = datetime(2026, 3, 8, 18, 0, 0, 600_000, tzinfo=timezone.utc)
+    process_entry_camera(state, "ENT", cam, {
+        20: Detection(0.20, 0.55, 0.30, 0.65, 0.92),
+        21: Detection(0.50, 0.55, 0.60, 0.65, 0.92),
+        22: Detection(0.80, 0.30, 0.90, 0.45, 0.92),
+    }, t2, {}, sink)
+    t3 = datetime(2026, 3, 8, 18, 0, 0, 900_000, tzinfo=timezone.utc)
+    process_entry_camera(state, "ENT", cam, {
+        20: Detection(0.20, 0.55, 0.30, 0.65, 0.93),
+        21: Detection(0.50, 0.55, 0.60, 0.65, 0.93),
+        22: Detection(0.80, 0.55, 0.90, 0.65, 0.93),
+    }, t3, {}, sink)
+    # Advance past the window — atomic flush.
+    t_flush = datetime(2026, 3, 8, 18, 0, 3, tzinfo=timezone.utc)
+    process_entry_camera(state, "ENT", cam, {}, t_flush, {}, sink)
+
+    entries = [e for e in flushed if e["event_type"] == "ENTRY"]
+    assert len(entries) == 3
+    sizes = {e["metadata"]["group_size"] for e in entries}
+    # The whole group must agree — no `{2, 3}` mix that the old race produced.
+    assert sizes == {3}, f"every entry in a co-arrival group must share group_size; got {sizes}"
 
 
 def test_solo_arrival_is_group_size_one():
@@ -255,6 +328,9 @@ def test_solo_arrival_is_group_size_one():
     t1 = datetime(2026, 3, 8, 18, 0, 1, tzinfo=timezone.utc)
     process_entry_camera(state, "ENT", cam,
                          {3: Detection(0.4, 0.55, 0.6, 0.65, 0.92)}, t1, {}, sink)
+    # Advance past the group window so the lone ENTRY flushes.
+    t_flush = datetime(2026, 3, 8, 18, 0, 4, tzinfo=timezone.utc)
+    process_entry_camera(state, "ENT", cam, {}, t_flush, {}, sink)
 
     entries = [e for e in captured if e["event_type"] == "ENTRY"]
     assert len(entries) == 1
@@ -297,3 +373,124 @@ def test_entry_camera_emits_entry_and_exit():
 
     types = [e["event_type"] for e in captured]
     assert "ENTRY" in types and "EXIT" in types
+
+
+def _entry_layout(y_threshold: float = 0.55, inbound: str = "down") -> StoreLayout:
+    return StoreLayout(
+        store_id="S",
+        cameras={
+            "ENT": CameraLayout(
+                name="ENT",
+                role="entry",
+                entry_line={"y_threshold": y_threshold, "inbound_direction": inbound, "x_range": [0.0, 1.0]},
+            )
+        },
+        clip_camera_map={},
+    )
+
+
+def test_entry_camera_does_not_count_passerby():
+    """A track first-seen *past* the entry line is NOT a fresh ENTRY — it's most
+    likely a person walking past the storefront on the outside aisle. Without
+    a prior in-corridor sample we can't distinguish 'stepped through the door'
+    from 'walked past on the outside', so we must abstain. This is the bug the
+    user reported: Store 1's entry camera was flagging mall-aisle pedestrians
+    as customers."""
+    state = PipelineState(layout=_entry_layout())
+    cam = state.layout.cameras["ENT"]
+    captured: list[dict] = []
+
+    class _Sink:
+        def add(self, e):
+            captured.append(e)
+
+    sink = _Sink()
+    t0 = datetime(2026, 3, 8, 18, 0, 0, tzinfo=timezone.utc)
+    # Frame 0: track first-seen at cy=0.7 — already past the threshold
+    process_entry_camera(state, "ENT", cam,
+                         {7: Detection(0.4, 0.65, 0.6, 0.75, 0.9)}, t0, {}, sink)
+    # Frame 1: same track, still past the threshold and walking outward
+    t1 = datetime(2026, 3, 8, 18, 0, 1, tzinfo=timezone.utc)
+    process_entry_camera(state, "ENT", cam,
+                         {7: Detection(0.4, 0.7, 0.6, 0.8, 0.91)}, t1, {}, sink)
+
+    types = [e["event_type"] for e in captured]
+    assert "ENTRY" not in types, f"passer-by should not produce ENTRY, got {types}"
+
+
+def test_floor_bootstrap_flap_does_not_emit_entry():
+    """A bootstrap-synthetic ENTRY is staged on the session, not emitted, until
+    the track has persisted at least BOOTSTRAP_PROMOTE_S. A 1-frame flap
+    (track_id appearing then vanishing within a few hundred ms) must NOT
+    produce a phantom ENTRY — that's what was inflating Store 1's
+    BillingQueue counts before this gate."""
+    layout = StoreLayout(
+        store_id="S",
+        cameras={
+            "FL": CameraLayout(
+                name="FL",
+                role="floor",
+                zones=[Zone(zone_id="Z1", polygon_norm=[(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)])],
+            )
+        },
+        clip_camera_map={},
+    )
+    state = PipelineState(layout=layout)
+    cam = layout.cameras["FL"]
+    captured: list[dict] = []
+
+    class _Sink:
+        def add(self, e):
+            captured.append(e)
+
+    sink = _Sink()
+    t0 = datetime(2026, 3, 8, 18, 0, 0, tzinfo=timezone.utc)
+    # Frame 0: track 11 bootstraps (no recent entry, no ReID match yet)
+    process_floor_camera(state, "FL", cam,
+                         {11: Detection(0.4, 0.4, 0.5, 0.5, 0.9)}, t0, {}, sink)
+    # Track disappears immediately — single-frame flap. No further frames.
+
+    entries = [e for e in captured if e["event_type"] == "ENTRY"]
+    assert entries == [], f"flap must not emit ENTRY, got {entries}"
+
+
+def test_floor_bootstrap_promotes_after_persistence():
+    """A bootstrap-synthetic ENTRY emits exactly once after the track has
+    been seen for at least BOOTSTRAP_PROMOTE_S. The emitted event's
+    timestamp matches the original bootstrap time so the timeline is honest."""
+    layout = StoreLayout(
+        store_id="S",
+        cameras={
+            "FL": CameraLayout(
+                name="FL",
+                role="floor",
+                zones=[Zone(zone_id="Z1", polygon_norm=[(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)])],
+            )
+        },
+        clip_camera_map={},
+    )
+    state = PipelineState(layout=layout)
+    cam = layout.cameras["FL"]
+    captured: list[dict] = []
+
+    class _Sink:
+        def add(self, e):
+            captured.append(e)
+
+    sink = _Sink()
+    t0 = datetime(2026, 3, 8, 18, 0, 0, tzinfo=timezone.utc)
+    # Bootstrap at t0, promote at t1 = t0 + 2 s (above the 1.5 s threshold)
+    process_floor_camera(state, "FL", cam,
+                         {11: Detection(0.4, 0.4, 0.5, 0.5, 0.9)}, t0, {}, sink)
+    t1 = datetime(2026, 3, 8, 18, 0, 2, tzinfo=timezone.utc)
+    process_floor_camera(state, "FL", cam,
+                         {11: Detection(0.41, 0.41, 0.51, 0.51, 0.9)}, t1, {}, sink)
+
+    entries = [e for e in captured if e["event_type"] == "ENTRY"]
+    assert len(entries) == 1, f"expected exactly one promoted ENTRY, got {len(entries)}"
+    # Confidence reflects the actual detection at promotion time (det.confidence),
+    # not a marker. Spec: emitted confidence must reflect signal quality.
+    assert entries[0]["confidence"] == 0.9
+    # Timestamp must be the original bootstrap ts (t0), not t1 — the timeline
+    # should reflect when the visitor actually appeared, not when we promoted.
+    assert entries[0]["timestamp"].startswith("2026-03-08T18:00:00")

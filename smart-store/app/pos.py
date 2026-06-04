@@ -23,7 +23,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable
 
-from .config import get_settings
+from .config import get_settings, parse_split_stores, parse_store_id_map
 from .db import Database
 
 log = logging.getLogger("api.pos")
@@ -35,19 +35,55 @@ def _parse_pos_ts(date_str: str, time_str: str) -> str:
     return dt.isoformat().replace("+00:00", "Z")
 
 
+def _replace_date(ts_iso: str, new_date_iso: str) -> str:
+    """Substitute the date portion of an ISO-8601 Z timestamp.
+
+    Keeps HH:MM:SS so a 12:15:05 sample preserves its wall-clock time on
+    the new day. Falls back to returning the original timestamp on
+    malformed input rather than raising — the loader's outer guards
+    already drop unparseable rows.
+    """
+    try:
+        parsed = datetime.fromisoformat(ts_iso.replace("Z", "+00:00"))
+        new_d = datetime.strptime(new_date_iso, "%Y-%m-%d").date()
+        out = parsed.replace(year=new_d.year, month=new_d.month, day=new_d.day)
+        return out.isoformat().replace("+00:00", "Z")
+    except (ValueError, TypeError):
+        return ts_iso
+
+
 async def load_pos_csv(path: str | Path | None = None) -> int:
-    """Read the POS CSV and bulk-insert collapsed transactions. Idempotent (PK)."""
+    """Read the POS CSV and bulk-insert collapsed transactions. Idempotent (PK).
+
+    Two optional translations run between CSV row parsing and aggregation:
+      * `pos_store_id_map` rewrites opaque CSV store ids (e.g. ST1008) into
+        the canonical STORE_BLR_* used by the events table.
+      * `pos_date_remap_to` swaps the date portion of every row's timestamp
+        onto a single ISO date — used to align the supplied sample CSV
+        (10-04-2026) with the pipeline's clip-start day (2026-03-08) so
+        the 5-minute correlation window can match.
+    Both default to "no translation"; production CSVs with proper keys
+    pass through unchanged.
+    """
     settings = get_settings()
     p = Path(path or settings.pos_csv_path)
     if not p.exists():
         log.warning("pos.csv_missing path=%s", p)
         return 0
+    store_id_map = parse_store_id_map(settings.pos_store_id_map)
+    date_remap = settings.pos_date_remap_to.strip()
+    # Demo-only: when the supplied CSV only has one store id and we want both
+    # stores to surface Purchase numbers, distribute rows by order_id parity.
+    split_stores = parse_split_stores(settings.pos_split_across_stores)
     db = Database.instance()
     inserted = 0
     aggregated: dict[int, dict] = {}  # order_id -> {store_id, ts, total}
     with p.open(newline="") as fh:
         reader = csv.DictReader(fh)
         for row in reader:
+            if not row or not any((v or "").strip() for v in row.values()):
+                # blank line in the middle of the CSV — skip without logging
+                continue
             try:
                 oid = int(row["order_id"])
                 store_id = row["store_id"]
@@ -55,6 +91,13 @@ async def load_pos_csv(path: str | Path | None = None) -> int:
                 amount = float(row["total_amount"] or 0)
             except (KeyError, ValueError):
                 continue
+            store_id = store_id_map.get(store_id, store_id)
+            # Demo split: rotate among configured store ids by order_id, so
+            # both stores get a coherent slice of the same CSV.
+            if split_stores:
+                store_id = split_stores[oid % len(split_stores)]
+            if date_remap:
+                ts = _replace_date(ts, date_remap)
             agg = aggregated.setdefault(
                 oid, {"store_id": store_id, "ts": ts, "total": 0.0,
                       "product_id": int(row.get("product_id") or 0),

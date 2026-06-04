@@ -19,6 +19,15 @@ from typing import Optional
 class ZoneDwell:
     enter_ts: datetime
     last_emit_ts: datetime  # for ZONE_DWELL throttling
+    # Rolling minimum detection confidence observed during the dwell. Spec:
+    # the emitted confidence must reflect the underlying signal's reliability
+    # — taking the min over the dwell window means a momentary high-conf
+    # sample doesn't mask earlier occluded frames.
+    min_confidence: float = 1.0
+
+    def observe(self, conf: float) -> None:
+        if conf < self.min_confidence:
+            self.min_confidence = float(conf)
 
 
 @dataclass
@@ -32,6 +41,13 @@ class VisitorSession:
     zone_dwells: dict[str, ZoneDwell] = field(default_factory=dict)
     visited_billing: bool = False
     floor_dwell_seconds: float = 0.0
+    # When a track bootstraps on a floor or billing camera (no matching
+    # entry-line crossing), we stage the synthetic ENTRY here instead of
+    # emitting immediately. The actual emit happens once the track has been
+    # seen for >= BOOTSTRAP_PROMOTE_S seconds — a track that disappears in
+    # under that window is treated as a ByteTrack flap and never produces an
+    # ENTRY. Cleared once the synthetic ENTRY has been emitted.
+    pending_entry_ts: Optional[datetime] = None
 
     def next_seq(self) -> int:
         self.session_seq += 1

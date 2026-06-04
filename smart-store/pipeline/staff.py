@@ -60,6 +60,14 @@ class StaffClassifier:
     # uniform-presence signal must be persistent to be trustworthy.
     match_streak: dict[str, int] = field(default_factory=dict)
     min_consecutive_matches: int = 3
+    # Symmetric streak: if a previously-promoted visitor produces this many
+    # consecutive non-matching frames we downgrade is_staff back to False.
+    # This breaks the "customer in dark hoodie" failure: 3 black frames pin
+    # them as staff, but once they turn around or remove the layer we now
+    # un-pin within `min_consecutive_disagreements` good frames. Keeping
+    # this larger than the promotion threshold avoids flapping.
+    disagree_streak: dict[str, int] = field(default_factory=dict)
+    min_consecutive_disagreements: int = 5
     vlm_provider: str = field(default_factory=lambda: os.getenv("PIPELINE_VLM_PROVIDER", ""))
     store_id: str = "STORE_BLR_001"
     # When True, _call_vlm writes the prompt + crop_hash to vlm_audit.jsonl
@@ -83,15 +91,28 @@ class StaffClassifier:
         dwell_seconds_in_floor: int = 0,
         visited_billing: bool = False,
     ) -> bool:
-        # Upgrade-only cache: once we've seen the uniform on this visitor we
-        # never downgrade. If the cached verdict is False and a new (likely
-        # better) crop arrives, re-evaluate so a back-facing first frame
-        # doesn't permanently mis-classify a staff member.
         cached = self.cache.get(visitor_id)
+        uniform_match = self._uniform_match(crop_bgr)
+
+        # If we've already classified this visitor as staff, allow a
+        # downgrade when enough consecutive non-matching frames pile up.
+        # This catches the "customer wearing dark clothes for the first
+        # 3 frames" failure: they get pinned as staff, then once they turn
+        # / remove the layer we un-pin within min_consecutive_disagreements.
         if cached is True:
+            if uniform_match is False:
+                disagree = self.disagree_streak.get(visitor_id, 0) + 1
+                self.disagree_streak[visitor_id] = disagree
+                if disagree >= self.min_consecutive_disagreements:
+                    self.cache[visitor_id] = False
+                    self.match_streak[visitor_id] = 0
+                    self.disagree_streak[visitor_id] = 0
+                    return False
+            elif uniform_match is True:
+                # A confirming frame resets the disagreement streak.
+                self.disagree_streak[visitor_id] = 0
             return True
 
-        uniform_match = self._uniform_match(crop_bgr)
         if uniform_match is True:
             # Persistence requirement: a single positive frame is not enough
             # to flip is_staff=True. Customers wearing dark clothes can pass
@@ -101,6 +122,7 @@ class StaffClassifier:
             self.match_streak[visitor_id] = streak
             if streak >= self.min_consecutive_matches:
                 self.cache[visitor_id] = True
+                self.disagree_streak[visitor_id] = 0
                 return True
             return False
         # Reset streak on any non-match (uniform_match is False or None) so a

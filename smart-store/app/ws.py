@@ -68,6 +68,19 @@ async def ws(
             return
 
     cursor = last_id
+    # On a fresh connection (last_id="$"), seed the live-stream panel with the
+    # 20 most recent events so the user sees activity immediately rather than
+    # an empty "waiting for events…" state. After the seed, advance the cursor
+    # to the latest stream id so we don't double-emit when XREAD wakes up.
+    if last_id == "$":
+        recent = await RedisClient.read_recent_events(store_id, count=20)
+        for entry_id, payload in recent:
+            cursor = entry_id
+            await ws.send_text(
+                json.dumps(
+                    {"type": "event", "stream_id": entry_id, "data": payload}
+                )
+            )
     last_snapshot = datetime.now(timezone.utc)
     try:
         while True:

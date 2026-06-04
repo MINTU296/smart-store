@@ -263,6 +263,37 @@ class RedisClient:
             log.warning("redis.xadd failed store=%s err=%s", store_id, e)
 
     @classmethod
+    async def read_recent_events(
+        cls, store_id: str, *, count: int = 20
+    ) -> list[tuple[str, dict]]:
+        """Return the most recent `count` entries from the per-store stream,
+        oldest-first. Used by the WS to seed the live-stream panel on connect
+        so the user immediately sees recent activity instead of an empty
+        'waiting for events…' state.
+
+        Returns an empty list on transient redis error or empty stream.
+        """
+        if not cls.is_ok():
+            return []
+        try:
+            entries = await cls._client.xrevrange(
+                cls.event_stream_key(store_id), count=count
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning("redis.xrevrange failed store=%s err=%s", store_id, e)
+            return []
+        out: list[tuple[str, dict]] = []
+        for entry_id, fields in reversed(entries or []):
+            raw = fields.get("event") if isinstance(fields, dict) else None
+            if raw is None:
+                continue
+            try:
+                out.append((entry_id, json.loads(raw)))
+            except Exception:  # noqa: BLE001
+                continue
+        return out
+
+    @classmethod
     async def read_event_stream(
         cls,
         store_id: str,
